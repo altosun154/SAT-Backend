@@ -17,7 +17,11 @@ def detect_explanation_start(blocks, question_matches):
     if not question_matches:
         return None
 
-    last_q_idx = question_matches[-1][0]
+    # Use the block for the highest-numbered match, not simply the physically
+    # last match — a stray "N." coincidentally matched deep in trailing prose
+    # (e.g. an explanation that happens to start a wrapped line with a number)
+    # would otherwise push last_q_idx past the real end of the questions.
+    last_q_idx = max(question_matches, key=lambda m: m[1])[0]
     first_q_num = question_matches[0][1]
 
     # Strategy 1: "Question N Correct Answer: X" format resetting to question 1

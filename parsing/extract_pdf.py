@@ -158,6 +158,21 @@ def extract_blocks(source):
             if count >= max(2, n_pages * 0.5)
         }
 
+        # Page-number stamps: a bare digit recurring in the same edge band on most
+        # pages. The text itself increments per page (1, 2, 3, ...), so the literal-
+        # text boilerplate check above never sees it repeat — group by vertical
+        # position instead, which stays fixed even as digit width changes the x0.
+        digit_band_counts = Counter()
+        for height, items in zip(page_heights, page_items):
+            head, foot = height * EDGE_BAND_FRACTION, height * (1 - EDGE_BAND_FRACTION)
+            for text, (_, y0, _, y1), _, url in items:
+                if text is not None and text.strip().isdigit() and (y0 < head or y1 > foot):
+                    digit_band_counts[(round(y0), round(y1))] += 1
+        page_number_bands = {
+            band for band, count in digit_band_counts.items()
+            if count >= max(2, n_pages * 0.5)
+        }
+
         blocks = []
         idx = 0
         for page_num, items in enumerate(page_items, 1):
@@ -175,6 +190,8 @@ def extract_blocks(source):
                 if text in boilerplate:
                     continue
                 if BOILERPLATE_RE.match(text):
+                    continue
+                if text.strip().isdigit() and (round(bbox[1]), round(bbox[3])) in page_number_bands:
                     continue
                 blocks.append(Block(
                     index=idx,

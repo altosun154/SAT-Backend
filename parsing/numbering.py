@@ -95,6 +95,11 @@ def find_best_pattern(blocks):
     for name, pattern in PATTERNS:
         matches = []
         for b in blocks:
+            # A grid/table row (e.g. an answer-key laid out in columns) can start
+            # with a bare "N." that reads like a question marker but isn't one —
+            # real question text is never itself a table row.
+            if b.style.get('is_table_row') or b.style.get('in_table'):
+                continue
             m = re.match(pattern, b.text, re.IGNORECASE)
             if m:
                 matches.append((b.index, int(m.group(1)), b))
