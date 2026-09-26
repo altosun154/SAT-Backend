@@ -1,10 +1,19 @@
+import io
 import os
 import re
+from collections import Counter
+from dataclasses import dataclass, replace
+from typing import Callable, Optional
+
 import pdfplumber
+import pymupdf
+from PIL import Image
 from docx import Document
 from docx.oxml.ns import qn
 from docx.table import Table
 from docx.text.paragraph import Paragraph
+
+import supabase_storage
 
 SECTION_RE = re.compile(r"^(Reading and Writing|Math)\s*[—-]\s*Module\s*([12])\s*$", re.IGNORECASE)
 # Difficulty tags appear either bracketed ("[EASY]") or as a bare word inside a
@@ -40,6 +49,19 @@ ANSWER_ENTRY_RE = re.compile(r"^(\d+)\.\s*([-−]?\d+(?:\.\d+)?|[A-Za-z])\.?\s*(
 MATH_ANSWER_ROW_RE = re.compile(r"^(\d+)\s+(\S+)\s+(\d+)\s+(\S+)\s*$")
 BOILERPLATE_RE = re.compile(r"^(Triumph Training Center)$", re.IGNORECASE)
 DIFFICULTY_TAG_RE = re.compile(r"^\[?(EASY|MEDIUM|HARD)\]?$", re.IGNORECASE)
+# A fill-in blank on a line of its own ("________") — belongs to whatever text it sits in.
+BLANK_LINE_RE = re.compile(r"^_{3,}$")
+
+# Vertical distance between the tops of two consecutive lines above which they're
+# separate paragraphs rather than one wrapped paragraph (known templates: ~14.5pt
+# wrap vs ~19pt paragraph spacing).
+PARAGRAPH_GAP = 17
+# Figures/tables are rasterised at this resolution, with a little breathing room.
+RENDER_DPI = 200
+VISUAL_PADDING = 4
+# How far above a table its caption/title line can sit, in pt.
+TABLE_CAPTION_GAP = 12
+VISUAL_STACK_GAP = 24  # px between visuals stacked into one question image
 
 # Filename → test name cleanup: strips OS duplicate-file prefixes, formats
 # camelCase/number-smashed words for readability, and drops a small set of
@@ -57,16 +79,82 @@ SUBJECT_MAP = {
 }
 
 
-def extract_lines_from_pdf(pdf_path, y_tolerance=3):
-    """Reconstruct visual reading order per page by clustering words with similar
-    vertical position into lines, since raw PDF content-stream order can interleave
-    absolutely-positioned labels (like difficulty tags) with body text."""
-    lines = []
+@dataclass
+class Line:
+    """A line of text (PDF) or a paragraph (DOCX), with the layout facts needed to
+    tell a passage (italic in known templates) from the question stem."""
+    text: str
+    italic: bool = False
+    page: int = 0
+    top: Optional[float] = None  # None for DOCX, where every item is its own paragraph
+    in_table: bool = False       # PDF table text — the table is imported as a Visual instead
+
+
+@dataclass
+class Visual:
+    """A figure or table shown with a question. Rendered lazily so that visuals
+    outside any question (e.g. answer-key tables) are never rasterised."""
+    render: Callable[[], Optional[bytes]]  # PNG bytes, or None if it can't be converted
+
+
+def _is_italic_font(fontname):
+    name = (fontname or "").lower()
+    return "italic" in name or "oblique" in name
+
+
+def _rect_key(rect):
+    return tuple(round(v) for v in rect)
+
+
+def _pdf_visual_rects(doc):
+    """Per page, the rects of figures and tables to show with questions. Images
+    drawn at the same spot on most pages (logo, watermark) are page decoration:
+    they're removed from the in-memory document so they don't show through
+    rendered figures and tables (the file on disk is never written)."""
+    page_images = [page.get_image_info(xrefs=True) for page in doc]
+    counts = Counter(key for infos in page_images for key in {_rect_key(i["bbox"]) for i in infos})
+    decoration = {key for key, n in counts.items() if n >= max(2, len(doc) * 0.5)}
+
+    result = []
+    for page, infos in zip(doc, page_images):
+        figures = []
+        for info in infos:
+            if _rect_key(info["bbox"]) not in decoration:
+                figures.append(pymupdf.Rect(info["bbox"]))
+            elif info["xref"]:
+                page.delete_image(info["xref"])
+        tables = [pymupdf.Rect(t.bbox) for t in page.find_tables().tables]
+        result.append((figures, tables))
+    return result
+
+
+def _pdf_renderer(page, rect):
+    clip = pymupdf.Rect(rect.x0 - VISUAL_PADDING, rect.y0 - VISUAL_PADDING,
+                        rect.x1 + VISUAL_PADDING, rect.y1 + VISUAL_PADDING) & page.rect
+    return lambda: page.get_pixmap(clip=clip, dpi=RENDER_DPI).tobytes("png")
+
+
+def _is_table_caption(line, table):
+    """A plain line sitting just above a table (its title) belongs with the table."""
+    return (
+        not line["italic"]
+        and table.y0 - TABLE_CAPTION_GAP <= line["bottom"] <= table.y0 + 1
+        and line["x0"] < table.x1 and line["x1"] > table.x0
+        and not QUESTION_RE.match(line["text"]) and not CHOICE_RE.match(line["text"])
+    )
+
+
+def extract_items_from_pdf(pdf_path, doc, y_tolerance=3):
+    """Return the document as Lines and Visuals in reading order. Text lines are
+    reconstructed per page by clustering words with similar vertical position,
+    since raw PDF content-stream order can interleave absolutely-positioned labels
+    (like difficulty tags) with body text. `doc` is the same file opened with
+    PyMuPDF, used for figures/tables; it must stay open until they're rendered."""
+    visual_rects = _pdf_visual_rects(doc)
+    items = []
     with pdfplumber.open(pdf_path) as pdf:
-        for page in pdf.pages:
-            words = page.extract_words()
-            if not words:
-                continue
+        for page_num, (page, (figures, tables)) in enumerate(zip(pdf.pages, visual_rects)):
+            words = page.extract_words(extra_attrs=["fontname"])
             clusters = []
             for w in sorted(words, key=lambda w: (w["top"], w["x0"])):
                 for c in clusters:
@@ -75,20 +163,50 @@ def extract_lines_from_pdf(pdf_path, y_tolerance=3):
                         break
                 else:
                     clusters.append({"top": w["top"], "words": [w]})
-            clusters.sort(key=lambda c: c["top"])
+
+            lines = []
             for c in clusters:
                 ws = sorted(c["words"], key=lambda w: w["x0"])
                 text = " ".join(w["text"] for w in ws).strip()
-                if text and not BOILERPLATE_RE.match(text):
-                    lines.append(text)
-    if not lines:
+                if not text or BOILERPLATE_RE.match(text):
+                    continue
+                total_chars = sum(len(w["text"]) for w in ws)
+                italic_chars = sum(len(w["text"]) for w in ws if _is_italic_font(w["fontname"]))
+                lines.append({
+                    "text": text, "top": c["top"], "bottom": max(w["bottom"] for w in ws),
+                    "x0": ws[0]["x0"], "x1": ws[-1]["x1"], "words": ws,
+                    "italic": italic_chars * 2 > total_chars,
+                })
+
+            for i, table in enumerate(tables):
+                for line in lines:
+                    if _is_table_caption(line, table):
+                        tables[i] = table = table | pymupdf.Rect(line["x0"], line["top"], line["x1"], line["bottom"])
+
+            positioned = [(r.y0, Visual(_pdf_renderer(doc[page_num], r))) for r in figures + tables]
+            for line in lines:
+                ws = line["words"]
+                in_table = sum(
+                    1 for w in ws
+                    if any(t.contains(pymupdf.Point((w["x0"] + w["x1"]) / 2, (w["top"] + w["bottom"]) / 2))
+                           for t in tables)
+                ) * 2 > len(ws)
+                positioned.append((line["top"], Line(
+                    line["text"], italic=line["italic"],
+                    page=page_num, top=line["top"], in_table=in_table,
+                )))
+
+            positioned.sort(key=lambda p: p[0])
+            items.extend(item for _, item in positioned)
+
+    if not any(isinstance(i, Line) for i in items):
         raise ValueError(
             "Could not extract any text from this PDF — it may be a scanned or "
             "flattened/image-only file with no selectable text layer. Try opening it "
             "in a PDF viewer and checking whether you can select/copy the question text; "
             "if not, re-export or re-generate the PDF from its original source document."
         )
-    return lines
+    return items
 
 
 def _iter_docx_block_items(doc):
@@ -101,16 +219,38 @@ def _iter_docx_block_items(doc):
             yield Table(child, doc)
 
 
-def extract_lines_from_docx(docx_path):
+def _to_png(blob):
+    """Convert an embedded image to PNG; None for formats Pillow can't read (EMF/WMF)."""
+    try:
+        buf = io.BytesIO()
+        Image.open(io.BytesIO(blob)).save(buf, format="PNG")
+        return buf.getvalue()
+    except Exception:
+        return None
+
+
+def _docx_paragraph_visuals(paragraph, doc):
+    visuals = []
+    for blip in paragraph._p.iter(qn("a:blip")):
+        part = doc.part.related_parts.get(blip.get(qn("r:embed")))
+        if part is not None:
+            visuals.append(Visual(lambda blob=part.blob: _to_png(blob)))
+    return visuals
+
+
+def extract_items_from_docx(docx_path):
     """Word paragraphs/tables are already stored in document order, so no
     position-based reconstruction is needed like with the PDF."""
     doc = Document(docx_path)
-    lines = []
+    items = []
     for block in _iter_docx_block_items(doc):
         if isinstance(block, Paragraph):
+            items.extend(_docx_paragraph_visuals(block, doc))
             text = re.sub(r"\s+", " ", block.text).strip()
             if text and not BOILERPLATE_RE.match(text):
-                lines.append(text)
+                runs = [r for r in block.runs if r.text.strip()]
+                italic_chars = sum(len(r.text) for r in runs if r.italic)
+                items.append(Line(text, italic=italic_chars * 2 > sum(len(r.text) for r in runs)))
         else:
             for row in block.rows:
                 cells = []
@@ -121,32 +261,68 @@ def extract_lines_from_docx(docx_path):
                         cells.append(text)
                 line = " ".join(c for c in cells if c)
                 if line:
-                    lines.append(line)
-    return lines
+                    items.append(Line(line))
+    return items
+
+
+def _paragraphs(lines):
+    """Group lines into (italic, text) paragraphs. A new paragraph starts on a
+    style change or a larger-than-wrap vertical gap; lines continuing onto the
+    next page stay in the same paragraph."""
+    paragraphs = []
+    prev = None
+    for line in lines:
+        starts_new = (
+            prev is None or line.top is None or prev.top is None
+            or line.italic != prev.italic
+            or (line.page == prev.page and line.top - prev.top > PARAGRAPH_GAP)
+        )
+        if starts_new:
+            paragraphs.append([line.italic, line.text])
+        else:
+            joiner = "" if paragraphs[-1][1].endswith(("-", "—")) else " "
+            paragraphs[-1][1] += joiner + line.text
+        prev = line
+    return paragraphs
 
 
 def _finalize_question(q, section, number):
     subject = SUBJECT_MAP[(section["subject_name"], section["module"])]
     is_grid_in = q["grid_in"] or not q["choices"]
+    paragraphs = _paragraphs(q["body"])
+
+    # Reading and Writing: the italic text is the passage the question refers to,
+    # shown in its own panel; the rest is the question stem. Math has no passage
+    # panel, so its given equations/data stay in the text, one per line.
+    passage = None
+    stem = [text for _, text in paragraphs]
+    if section["subject_name"] == "Reading and Writing":
+        passage_paras = [text for italic, text in paragraphs if italic]
+        stem_paras = [text for italic, text in paragraphs if not italic]
+        if passage_paras and stem_paras:
+            passage, stem = "\n".join(passage_paras), stem_paras
+
     return {
         "question_number": number,
         "section_key": (section["subject_name"], section["module"]),
-        "text": " ".join(q["body_lines"]).strip(),
+        "text": "\n".join(stem).strip(),
         "choice_a": "" if is_grid_in else q["choices"].get("A", ""),
         "choice_b": "" if is_grid_in else q["choices"].get("B", ""),
         "choice_c": "" if is_grid_in else q["choices"].get("C", ""),
         "choice_d": "" if is_grid_in else q["choices"].get("D", ""),
         "subject": subject,
         "difficulty": q["difficulty"].lower() if q["difficulty"] else None,
-        "passage": None,
-        "image_url": None,
+        "passage": passage,
+        "image_url": None,  # uploaded from "visuals" once the answer key checks out
+        "visuals": q["visuals"],
         "skill": None,
         "module_variant": None,
         "correct_answer": None,  # filled in from the answer key later
+        "explanation": None,
     }
 
 
-def _parse_questions(lines):
+def _parse_questions(items):
     questions = []
     section = None
     current_q = None
@@ -156,47 +332,62 @@ def _parse_questions(lines):
         if current_q is not None:
             questions.append(_finalize_question(current_q, section, current_number))
 
-    i = 0
-    while i < len(lines):
-        line = lines[i]
+    for i, item in enumerate(items):
+        if isinstance(item, Visual):
+            if current_q is not None:
+                current_q["visuals"].append(item)
+            continue
 
+        line = item.text
         if ANSWER_KEYS_RE.match(line):
             flush()
             return questions, i
+
+        # Table text is imported as part of the table's image; the title banner
+        # repeats at the top of every page.
+        if item.in_table or TITLE_RE.search(line):
+            continue
 
         m = SECTION_RE.match(line)
         if m:
             flush()
             current_q = None
             section = {"subject_name": m.group(1) if m.group(1) == "Math" else "Reading and Writing", "module": m.group(2)}
-            i += 1
             continue
 
         m = QUESTION_RE.match(line)
         if m:
             flush()
             current_number = int(m.group(1))
-            current_q = {"body_lines": [], "choices": {}, "grid_in": False, "difficulty": m.group(2)}
-            i += 1
+            current_q = {"body": [], "choices": {}, "last_choice": None, "visuals": [],
+                         "grid_in": False, "difficulty": m.group(2)}
             continue
 
-        if current_q is not None:
-            m = CHOICE_RE.match(line)
-            if m:
-                current_q["choices"][m.group(1)] = m.group(2).strip()
-            elif GRID_IN_RE.search(line):
-                current_q["grid_in"] = True
-            elif DIFFICULTY_TAG_RE.match(line):
-                current_q["difficulty"] = DIFFICULTY_TAG_RE.match(line).group(1)
-            else:
-                current_q["body_lines"].append(line)
-        i += 1
+        if current_q is None:
+            continue
+
+        m = CHOICE_RE.match(line)
+        if m:
+            current_q["choices"][m.group(1)] = m.group(2).strip()
+            current_q["last_choice"] = m.group(1)
+        elif GRID_IN_RE.search(line):
+            current_q["grid_in"] = True
+        elif DIFFICULTY_TAG_RE.match(line):
+            current_q["difficulty"] = DIFFICULTY_TAG_RE.match(line).group(1)
+        elif current_q["last_choice"]:
+            # a long choice wrapping onto the next line
+            letter = current_q["last_choice"]
+            current_q["choices"][letter] = f"{current_q['choices'][letter]} {line}".strip()
+        else:
+            if BLANK_LINE_RE.match(line) and current_q["body"]:
+                item = replace(item, italic=current_q["body"][-1].italic)
+            current_q["body"].append(item)
 
     flush()
-    return questions, len(lines)
+    return questions, len(items)
 
 
-def _parse_answer_keys(lines):
+def _parse_answer_keys(items):
     """Single pass over the answer-key section, tracking (subject, module) state
     as it goes. Two known template shapes are supported:
       - bare "Module 1"/"Module 2" headings nested under a "Reading and Writing —
@@ -205,40 +396,49 @@ def _parse_answer_keys(lines):
       - full "Reading and Writing — Module N" / "Math — Module N" headings used
         directly (no separate wrapper heading), with both subjects' answers given
         as numbered entries ("N. B — explanation" / "N. 4. explanation")
-    Stops entirely at a "Bubble Summary" appendix, if present — that section is
-    never used as an answer source.
+    Lines following a numbered entry, up to the next entry or heading, are that
+    question's explanation. Stops entirely at a "Bubble Summary" appendix, if
+    present — that section is never used as an answer source.
+    Returns (answers, explanations), both keyed by (subject, module) then number.
     """
-    answers = {
-        ("Reading and Writing", "1"): {},
-        ("Reading and Writing", "2"): {},
-        ("Math", "1"): {},
-        ("Math", "2"): {},
-    }
+    keys = [("Reading and Writing", "1"), ("Reading and Writing", "2"), ("Math", "1"), ("Math", "2")]
+    answers = {key: {} for key in keys}
+    explanations = {key: {} for key in keys}
     current_subject = None
     current_module = None
+    explaining = None  # (key, number) whose explanation lines are being collected
 
-    for line in lines:
+    for item in items:
+        if isinstance(item, Visual):
+            continue
+        line = item.text
         if BUBBLE_SUMMARY_RE.search(line):
             break
+        if TITLE_RE.search(line):
+            continue
 
         m = SECTION_RE.match(line)
         if m:
             current_subject = "Math" if m.group(1) == "Math" else "Reading and Writing"
             current_module = m.group(2)
+            explaining = None
             continue
 
         if RW_ANSWER_HEADER_RE.search(line):
             current_subject = "Reading and Writing"
             current_module = None
+            explaining = None
             continue
         if MATH_ANSWER_HEADER_RE.search(line):
             current_subject = "Math"
             current_module = None
+            explaining = None
             continue
 
         m = MODULE_HEADING_RE.match(line)
         if m:
             current_module = m.group(1)
+            explaining = None
             continue
 
         if current_subject is None or current_module is None:
@@ -247,16 +447,32 @@ def _parse_answer_keys(lines):
 
         m = ANSWER_ENTRY_RE.match(line)
         if m:
+            num = int(m.group(1))
             value = m.group(2).replace("−", "-")
-            answers[key][int(m.group(1))] = value.upper() if value.isalpha() else value
+            answers[key][num] = value.upper() if value.isalpha() else value
+            explaining = (key, num)
+            # "N. B — explanation" and grid-in "N. 4. explanation" put the
+            # explanation inline; "N. B. Ancient" just echoes the choice text.
+            rest = m.group(3).strip()
+            if rest[:1] in ("—", "-") or not value.isalpha():
+                rest = rest.lstrip("—- ").strip()
+                if rest:
+                    explanations[key][num] = rest
             continue
 
         m = MATH_ANSWER_ROW_RE.match(line)
         if m and current_subject == "Math":
             answers[key][int(m.group(1))] = m.group(2)
             answers[key][int(m.group(3))] = m.group(4)
+            explaining = None
+            continue
 
-    return answers
+        if explaining:
+            ekey, num = explaining
+            existing = explanations[ekey].get(num)
+            explanations[ekey][num] = f"{existing}\n{line}" if existing else line
+
+    return answers, explanations
 
 
 def _clean_test_name_from_filename(filename):
@@ -270,20 +486,48 @@ def _clean_test_name_from_filename(filename):
     return re.sub(r"\s+", " ", " ".join(words)).strip()
 
 
-def _parse_lines(lines, original_filename=None):
+def _combine_pngs(pngs):
+    """Stack several PNGs vertically, centred, into one image."""
+    if len(pngs) == 1:
+        return pngs[0]
+    images = [Image.open(io.BytesIO(p)).convert("RGB") for p in pngs]
+    width = max(img.width for img in images)
+    height = sum(img.height for img in images) + VISUAL_STACK_GAP * (len(images) - 1)
+    canvas = Image.new("RGB", (width, height), "white")
+    y = 0
+    for img in images:
+        canvas.paste(img, ((width - img.width) // 2, y))
+        y += img.height + VISUAL_STACK_GAP
+    buf = io.BytesIO()
+    canvas.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _upload_visuals(visuals, upload_image):
+    """Render a question's figures/tables into one PNG and upload it. Returns the
+    public URL, or None if there's nothing to show or the upload isn't possible."""
+    pngs = [png for png in (v.render() for v in visuals) if png]
+    if not pngs:
+        return None
+    return upload_image(_combine_pngs(pngs), ext="png", content_type="image/png")
+
+
+def _parse_lines(items, original_filename=None, upload_image=None):
+    upload_image = upload_image or supabase_storage.upload_image
     test_name = _clean_test_name_from_filename(original_filename) if original_filename else ""
     if not test_name:
-        title_match = next((TITLE_RE.search(l) for l in lines if TITLE_RE.search(l)), None)
+        texts = [i.text for i in items if isinstance(i, Line)]
+        title_match = next((TITLE_RE.search(t) for t in texts if TITLE_RE.search(t)), None)
         test_name = f"SAT Practice Test {title_match.group(1)}" if title_match else "SAT Practice Test"
 
-    questions, answer_key_start = _parse_questions(lines)
+    questions, answer_key_start = _parse_questions(items)
     if not questions:
         raise ValueError(
             "Text was extracted from this file, but no \"Question N\" headings matched "
             "the expected template. The file's section headers, question numbering, or "
             "layout may not match the practice-test template this importer expects."
         )
-    answer_keys = _parse_answer_keys(lines[answer_key_start:])
+    answer_keys, explanations = _parse_answer_keys(items[answer_key_start:])
 
     missing_answers = []
     for q in questions:
@@ -293,33 +537,43 @@ def _parse_lines(lines, original_filename=None):
         if answer is None:
             missing_answers.append((key, num))
         q["correct_answer"] = answer or ""
+        q["explanation"] = explanations.get(key, {}).get(num)
         del q["question_number"]
 
     if missing_answers:
         details = ", ".join(f"{k[0]} Module {k[1]} Q{n}" for k, n in missing_answers)
         raise ValueError(f"Could not find answer-key entries for: {details}")
 
+    for q in questions:
+        visuals = q.pop("visuals")
+        if visuals:
+            q["image_url"] = _upload_visuals(visuals, upload_image)
+
     return {"test_name": test_name, "questions": questions}
 
 
-def parse_pdf(pdf_path, original_filename=None):
-    return _parse_lines(extract_lines_from_pdf(pdf_path), original_filename or os.path.basename(pdf_path))
+def parse_pdf(pdf_path, original_filename=None, upload_image=None):
+    with pymupdf.open(pdf_path) as doc:
+        items = extract_items_from_pdf(pdf_path, doc)
+        return _parse_lines(items, original_filename or os.path.basename(pdf_path), upload_image)
 
 
-def parse_docx(docx_path, original_filename=None):
-    return _parse_lines(extract_lines_from_docx(docx_path), original_filename or os.path.basename(docx_path))
+def parse_docx(docx_path, original_filename=None, upload_image=None):
+    return _parse_lines(extract_items_from_docx(docx_path), original_filename or os.path.basename(docx_path), upload_image)
 
 
-def parse_test_file(path, original_filename=None):
+def parse_test_file(path, original_filename=None, upload_image=None):
     """Dispatch to the right parser based on file extension. `original_filename`
     is used to derive the test name — pass the user-facing upload filename when
     `path` is a temp file (e.g. the admin upload endpoint), since a random temp
-    filename wouldn't produce a meaningful test name."""
+    filename wouldn't produce a meaningful test name. `upload_image(png_bytes,
+    ext=, content_type=)` stores a question's figure and returns its URL; it
+    defaults to the Supabase question-images bucket."""
     ext = os.path.splitext(path)[1].lower()
     if ext == ".pdf":
-        return parse_pdf(path, original_filename)
+        return parse_pdf(path, original_filename, upload_image)
     if ext == ".docx":
-        return parse_docx(path, original_filename)
+        return parse_docx(path, original_filename, upload_image)
     raise ValueError(f"Unsupported test file type: {ext or '(none)'}. Expected .pdf or .docx.")
 
 
