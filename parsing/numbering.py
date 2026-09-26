@@ -2,6 +2,7 @@ import re
 
 PATTERNS = [
     ('question_word',           r'^\s*Question\s+(\d+)[.:)]?\s*(?:\[?(EASY|MEDIUM|HARD)\]?)?\s*$'),
+    ('question_word_set',       r'^\s*Question\s+(\d+)\s+\(Set\s+\d+\)\s*$'),
     ('question_correct_answer', r'^\s*Question\s+(\d+)\s+Correct\s+Answer\s*:\s*[A-D]\s*$'),
     ('dot',                     r'^\s*(\d+)\.\s+\S'),
     ('dot_bare',                r'^\s*(\d+)\.\s*$'),
@@ -126,9 +127,7 @@ def _filter_increasing(matches):
 
 
 def find_best_pattern(blocks):
-    best = None
-    best_score = -1
-    best_first_block = None
+    candidates = []
     for name, pattern in PATTERNS:
         matches = []
         for b in blocks:
@@ -142,22 +141,24 @@ def find_best_pattern(blocks):
                 matches.append((b.index, int(m.group(1)), b))
         if len(matches) < 2:
             continue
-        score = _score_matches([(i, n) for i, n, _ in matches])
-        first_block = matches[0][0]
-        # On a tie, prefer whichever numbering starts earliest in the document.
-        # A document's explanations can independently number "Question 1..N" and
-        # score just as perfectly as the real questions do — real questions are
-        # always numbered before their own explanations, so the earlier-starting
-        # pattern is the real one. Without this, pattern order in the PATTERNS
-        # list above would arbitrarily decide the tie via strict '>'.
-        if score > best_score or (score == best_score and first_block < best_first_block):
-            best_score = score
-            best_first_block = first_block
-            best = (name, pattern, matches)
-    if best:
-        name, pattern, matches = best
-        best = (name, pattern, _filter_increasing(matches))
-    return best, best_score
+        candidates.append((name, pattern, matches, _filter_increasing(matches)))
+
+    if not candidates:
+        return None, -1
+
+    # Rank by the number of real (noise-filtered) matches, not the raw ratio —
+    # a single coincidental false match (a wrapped-line number, an incidental
+    # year) can drag a pattern's raw score just below a rival pattern that
+    # matches something else just as cleanly (e.g. an explanations section
+    # independently numbered "Question 1..N"), even though it has far more
+    # genuine matches. On a tie, prefer whichever starts earliest in the
+    # document — real questions are always numbered before their own
+    # explanations, so the earlier-starting pattern is the real one.
+    name, pattern, matches, filtered = max(
+        candidates, key=lambda c: (len(c[3]), -c[2][0][0])
+    )
+    score = _score_matches([(i, n) for i, n, _ in matches])
+    return (name, pattern, filtered), score
 
 
 def split_into_questions(blocks, matches):
