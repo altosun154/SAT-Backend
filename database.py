@@ -5,9 +5,14 @@ from sqlalchemy.orm import declarative_base, sessionmaker
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///sat.db")
 
-# Render gives postgres:// but SQLAlchemy requires postgresql://
+# Render gives postgres:// but SQLAlchemy requires postgresql://. Pin the driver
+# explicitly to psycopg2 (the one in requirements.txt) rather than leaving it to
+# SQLAlchemy's default resolution — that default changed between 2.0.x and 2.1.x
+# to prefer the psycopg (v3) package, which isn't installed, and broke the build.
 if DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+psycopg2://", 1)
+elif DATABASE_URL.startswith("postgresql://"):
+    DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg2://", 1)
 
 engine = create_engine(DATABASE_URL)
 
