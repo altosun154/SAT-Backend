@@ -57,7 +57,7 @@ BLANK_LINE_RE = re.compile(r"^_{3,}$")
 # wrap vs ~19pt paragraph spacing).
 PARAGRAPH_GAP = 17
 # Figures/tables are rasterised at this resolution, with a little breathing room.
-RENDER_DPI = 200
+RENDER_DPI = 150
 VISUAL_PADDING = 4
 # How far above a table its caption/title line can sit, in pt.
 TABLE_CAPTION_GAP = 12
@@ -107,31 +107,40 @@ def _rect_key(rect):
 
 
 def _pdf_visual_rects(doc):
-    """Per page, the rects of figures and tables to show with questions. Images
-    drawn at the same spot on most pages (logo, watermark) are page decoration:
-    they're removed from the in-memory document so they don't show through
-    rendered figures and tables (the file on disk is never written)."""
-    page_images = [page.get_image_info(xrefs=True) for page in doc]
+    """Per page, the rects of figures and tables to show with questions, plus the
+    pixel sizes of page-decoration images (logo, watermark): images drawn at the
+    same spot on most pages. Positions only — asking PyMuPDF for image xrefs here
+    would decode every image on every page (~180 MB on a 45-page test)."""
+    page_images = [page.get_image_info() for page in doc]
     counts = Counter(key for infos in page_images for key in {_rect_key(i["bbox"]) for i in infos})
     decoration = {key for key, n in counts.items() if n >= max(2, len(doc) * 0.5)}
+    decoration_sizes = {
+        (i["width"], i["height"])
+        for infos in page_images for i in infos if _rect_key(i["bbox"]) in decoration
+    }
 
     result = []
     for page, infos in zip(doc, page_images):
-        figures = []
-        for info in infos:
-            if _rect_key(info["bbox"]) not in decoration:
-                figures.append(pymupdf.Rect(info["bbox"]))
-            elif info["xref"]:
-                page.delete_image(info["xref"])
+        figures = [pymupdf.Rect(i["bbox"]) for i in infos if _rect_key(i["bbox"]) not in decoration]
         tables = [pymupdf.Rect(t.bbox) for t in page.find_tables().tables]
         result.append((figures, tables))
-    return result
+    return result, decoration_sizes
 
 
-def _pdf_renderer(page, rect):
+def _pdf_renderer(page, rect, decoration_sizes):
+    """Render `rect` of `page` to PNG. Decoration images on the page are removed
+    from the in-memory document first so they don't show through the figure or
+    table (the file on disk is never written)."""
     clip = pymupdf.Rect(rect.x0 - VISUAL_PADDING, rect.y0 - VISUAL_PADDING,
                         rect.x1 + VISUAL_PADDING, rect.y1 + VISUAL_PADDING) & page.rect
-    return lambda: page.get_pixmap(clip=clip, dpi=RENDER_DPI).tobytes("png")
+
+    def render():
+        for img in page.get_images(full=True):
+            xref, width, height = img[0], img[2], img[3]
+            if (width, height) in decoration_sizes:
+                page.delete_image(xref)
+        return page.get_pixmap(clip=clip, dpi=RENDER_DPI).tobytes("png")
+    return render
 
 
 def _is_table_caption(line, table):
@@ -150,7 +159,7 @@ def extract_items_from_pdf(pdf_path, doc, y_tolerance=3):
     since raw PDF content-stream order can interleave absolutely-positioned labels
     (like difficulty tags) with body text. `doc` is the same file opened with
     PyMuPDF, used for figures/tables; it must stay open until they're rendered."""
-    visual_rects = _pdf_visual_rects(doc)
+    visual_rects, decoration_sizes = _pdf_visual_rects(doc)
     items = []
     with pdfplumber.open(pdf_path) as pdf:
         for page_num, (page, (figures, tables)) in enumerate(zip(pdf.pages, visual_rects)):
@@ -183,7 +192,7 @@ def extract_items_from_pdf(pdf_path, doc, y_tolerance=3):
                     if _is_table_caption(line, table):
                         tables[i] = table = table | pymupdf.Rect(line["x0"], line["top"], line["x1"], line["bottom"])
 
-            positioned = [(r.y0, Visual(_pdf_renderer(doc[page_num], r))) for r in figures + tables]
+            positioned = [(r.y0, Visual(_pdf_renderer(doc[page_num], r, decoration_sizes))) for r in figures + tables]
             for line in lines:
                 ws = line["words"]
                 in_table = sum(
@@ -198,6 +207,7 @@ def extract_items_from_pdf(pdf_path, doc, y_tolerance=3):
 
             positioned.sort(key=lambda p: p[0])
             items.extend(item for _, item in positioned)
+            page.close()  # pdfplumber otherwise caches every page's objects until the file closes
 
     if not any(isinstance(i, Line) for i in items):
         raise ValueError(
