@@ -89,6 +89,24 @@ def _score_matches(matches):
     return run / len(matches)
 
 
+def _filter_increasing(matches):
+    """Keep only matches whose number strictly increases over the last accepted
+    one. A wrapped line of body text can coincidentally start with a number that
+    matches the numbering pattern (e.g. "...g(x) = f(x) +" / "5. As x increases
+    ..." split across two lines, or a stray reference to a number inside an
+    explanation) without being a real question boundary — since real numbering
+    only goes up, such a match is noise and gets folded into the previous
+    question's body instead of starting a bogus new one."""
+    accepted = []
+    last_number = None
+    for entry in matches:
+        number = entry[1]
+        if last_number is None or number > last_number:
+            accepted.append(entry)
+            last_number = number
+    return accepted
+
+
 def find_best_pattern(blocks):
     best = None
     best_score = -1
@@ -109,6 +127,9 @@ def find_best_pattern(blocks):
         if score > best_score:
             best_score = score
             best = (name, pattern, matches)
+    if best:
+        name, pattern, matches = best
+        best = (name, pattern, _filter_increasing(matches))
     return best, best_score
 
 
