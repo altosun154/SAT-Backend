@@ -1,7 +1,44 @@
 from flask import Blueprint, jsonify, request
-from database import SessionLocal, Question, Response, TestCompletion
+from database import SessionLocal, Question, Response, TestCompletion, TestQuestion
 
 responses_bp = Blueprint("responses", __name__)
+
+
+# --- Module 2 routing (not yet wired into a live route — see get_module2_difficulty
+# below, which still runs the old weighted-difficulty logic against `Question`.
+# This will replace it once `test_questions` has real data.) ---
+
+MODULE2_THRESHOLDS = {
+    "reading_writing": {"total": 27, "min_correct_for_higher": 19},
+    "math": {"total": 22, "min_correct_for_higher": 16},
+}
+
+
+def route_module2(section, correct_count):
+    """Flat correct-count threshold per section, per the client's spec — not
+    weighted by question difficulty like the legacy WEIGHTED_THRESHOLD logic."""
+    threshold = MODULE2_THRESHOLDS[section]["min_correct_for_higher"]
+    return "hard" if correct_count >= threshold else "easy"
+
+
+def get_module1_correct_count(db, user_id, session_id, section):
+    """Count correct Module 1 answers for this session, scoped to one section,
+    against the test_questions table."""
+    responses = db.query(Response).filter(
+        Response.user_id == user_id,
+        Response.session_id == session_id,
+    ).all()
+    question_ids = [r.question_id for r in responses]
+    if not question_ids:
+        return 0
+    questions_by_id = {
+        q.id: q for q in db.query(TestQuestion).filter(TestQuestion.id.in_(question_ids)).all()
+    }
+    return sum(
+        1 for r in responses
+        if r.is_correct and (q := questions_by_id.get(r.question_id))
+        and q.section == section and q.module == 1
+    )
 
 
 # --- Responses ---

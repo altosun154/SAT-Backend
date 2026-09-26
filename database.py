@@ -60,6 +60,30 @@ class Question(Base):
     archived = Column(Boolean, default=False, nullable=False)
 
 
+class TestQuestion(Base):
+    """Questions for actual test-taking (Module 1 / Module 2), separate from the
+    `questions` table which holds question-bank/practice content. Not yet wired
+    into any live route — added ahead of the adaptive Module 2 routing logic
+    that will query it once this table has real data."""
+    __tablename__ = "test_questions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    test_id = Column(Integer, ForeignKey("tests.id"), nullable=False)
+    section = Column(String(20), nullable=False)          # "math" | "reading_writing"
+    module = Column(Integer, nullable=False)              # 1 or 2
+    module2_variant = Column(String(10), nullable=True)   # "easy" | "hard" — null for module 1
+    difficulty = Column(String(20), nullable=True)        # "easy", "medium", "hard"
+    order = Column(Integer, nullable=True)                # position within the module
+    text = Column(Text, nullable=False)
+    choice_a = Column(Text, nullable=False)
+    choice_b = Column(Text, nullable=False)
+    choice_c = Column(Text, nullable=False)
+    choice_d = Column(Text, nullable=False)
+    correct_answer = Column(String(10), nullable=False)
+    explanation = Column(Text, nullable=True)
+    image_url = Column(String(500), nullable=True)
+
+
 class ParentStudent(Base):
     __tablename__ = "parent_students"
 
