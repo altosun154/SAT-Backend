@@ -128,6 +128,7 @@ def _filter_increasing(matches):
 def find_best_pattern(blocks):
     best = None
     best_score = -1
+    best_first_block = None
     for name, pattern in PATTERNS:
         matches = []
         for b in blocks:
@@ -142,8 +143,16 @@ def find_best_pattern(blocks):
         if len(matches) < 2:
             continue
         score = _score_matches([(i, n) for i, n, _ in matches])
-        if score > best_score:
+        first_block = matches[0][0]
+        # On a tie, prefer whichever numbering starts earliest in the document.
+        # A document's explanations can independently number "Question 1..N" and
+        # score just as perfectly as the real questions do — real questions are
+        # always numbered before their own explanations, so the earlier-starting
+        # pattern is the real one. Without this, pattern order in the PATTERNS
+        # list above would arbitrarily decide the tie via strict '>'.
+        if score > best_score or (score == best_score and first_block < best_first_block):
             best_score = score
+            best_first_block = first_block
             best = (name, pattern, matches)
     if best:
         name, pattern, matches = best
