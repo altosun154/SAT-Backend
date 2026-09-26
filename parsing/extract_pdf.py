@@ -91,9 +91,17 @@ def extract_blocks(source):
                 row.sort(key=lambda s: s['bbox'][0])
                 parts, is_table_row = [], False
                 prev_x1 = None
+                prev_was_superscript = False
                 for s in row:
                     text = s['text']
                     x0 = s['bbox'][0]
+                    # PyMuPDF sets bit 0 of a span's flags for superscript text.
+                    # An exponent like x² is typeset this way (a smaller, raised
+                    # "2" glyph, not the Unicode superscript character), so without
+                    # this it silently reads as the plain digit next to the base —
+                    # "x2" instead of "x^2". Only mark the start of a superscript
+                    # run so a multi-span exponent like "12" doesn't become "^1^2".
+                    is_superscript = bool(s.get('flags', 0) & 1)
                     if prev_x1 is not None:
                         gap = x0 - prev_x1
                         if gap > TABLE_GAP_PT:
@@ -101,8 +109,11 @@ def extract_blocks(source):
                             is_table_row = True
                         elif gap > 1:
                             parts.append(' ')
+                    if is_superscript and not prev_was_superscript:
+                        parts.append('^')
                     parts.append(text)
                     prev_x1 = s['bbox'][2]
+                    prev_was_superscript = is_superscript
                 text = ''.join(parts).strip(' |').strip()
                 if not text:
                     continue

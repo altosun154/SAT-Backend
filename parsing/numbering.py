@@ -90,21 +90,39 @@ def _score_matches(matches):
 
 
 def _filter_increasing(matches):
-    """Keep only matches whose number strictly increases over the last accepted
-    one. A wrapped line of body text can coincidentally start with a number that
-    matches the numbering pattern (e.g. "...g(x) = f(x) +" / "5. As x increases
-    ..." split across two lines, or a stray reference to a number inside an
-    explanation) without being a real question boundary — since real numbering
-    only goes up, such a match is noise and gets folded into the previous
-    question's body instead of starting a bogus new one."""
-    accepted = []
-    last_number = None
-    for entry in matches:
-        number = entry[1]
-        if last_number is None or number > last_number:
-            accepted.append(entry)
-            last_number = number
-    return accepted
+    """Keep the longest run of matches whose numbers strictly increase, in the
+    order they appear in the document (a true longest increasing subsequence,
+    not a greedy left-to-right pass).
+
+    A wrapped line of body text can coincidentally start with a number that
+    matches the numbering pattern — "...g(x) = f(x) +" / "5. As x increases
+    ..." split across two lines, a stray reference to a number inside an
+    explanation, or an incidental year like "2024" — without being a real
+    question boundary. A greedy "accept if greater than the last one" pass
+    breaks badly on an outlier in the *middle* of the sequence: once it accepts
+    a big stray number, every real (smaller) number after it fails the
+    greater-than check and gets rejected too, wiping out the rest of the
+    document. Taking the actual longest increasing subsequence instead means
+    a single outlier only ever costs itself.
+    """
+    n = len(matches)
+    if n < 2:
+        return matches
+    numbers = [m[1] for m in matches]
+    lengths = [1] * n
+    prev = [-1] * n
+    for i in range(n):
+        for j in range(i):
+            if numbers[j] < numbers[i] and lengths[j] + 1 > lengths[i]:
+                lengths[i] = lengths[j] + 1
+                prev[i] = j
+    i = max(range(n), key=lambda k: lengths[k])
+    seq = []
+    while i != -1:
+        seq.append(matches[i])
+        i = prev[i]
+    seq.reverse()
+    return seq
 
 
 def find_best_pattern(blocks):
