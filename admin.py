@@ -465,6 +465,7 @@ def upload_test():
                 passage=q.get("passage"),
                 image_url=q.get("image_url"),
                 skill=q.get("skill"),
+                explanation=q.get("explanation"),
                 module_variant=q.get("module_variant"),
             ))
 
