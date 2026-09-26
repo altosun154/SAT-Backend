@@ -292,7 +292,8 @@ def get_correct_questions():
                 "correct_answer": question.correct_answer,
                 "selected_answer": r.selected_answer,
                 "subject": question.subject,
-                "difficulty": question.difficulty
+                "difficulty": question.difficulty,
+                "explanation": question.explanation or "Explanation coming soon."
             })
 
         return jsonify(result)
@@ -333,7 +334,8 @@ def get_skipped_questions():
                 "choice_d": question.choice_d,
                 "correct_answer": question.correct_answer,
                 "subject": question.subject,
-                "difficulty": question.difficulty
+                "difficulty": question.difficulty,
+                "explanation": question.explanation or "Explanation coming soon."
             })
 
         return jsonify(result)

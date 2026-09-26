@@ -3,8 +3,9 @@ import tempfile
 import jwt
 from datetime import datetime, timezone, timedelta
 from functools import wraps
-from flask import Blueprint, jsonify, request
-from database import SessionLocal, User, Test, Assignment, Response, Question
+from flask import Blueprint, g, jsonify, request
+from sqlalchemy.exc import IntegrityError
+from database import SessionLocal, User, Test, Assignment, Response, Question, TestUnlock
 from test_file_parser import parse_test_file
 
 ALLOWED_TEST_UPLOAD_EXTENSIONS = (".pdf", ".docx")
@@ -30,6 +31,34 @@ def require_admin(f):
             user = db.query(User).filter(User.id == payload["user_id"]).first()
             if not user or user.role != "admin":
                 return jsonify({"error": "Forbidden"}), 403
+        finally:
+            db.close()
+        return f(*args, **kwargs)
+    return decorated
+
+
+def require_login(f):
+    """Require a valid Bearer JWT for an active account; exposes the caller as
+    g.user_id / g.user_role. The short-lived 2FA-pending token doesn't count."""
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        auth = request.headers.get("Authorization", "")
+        if not auth.startswith("Bearer "):
+            return jsonify({"error": "Unauthorized"}), 401
+        token = auth.split(" ", 1)[1]
+        try:
+            payload = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
+        except jwt.PyJWTError:
+            return jsonify({"error": "Invalid token"}), 401
+        if payload.get("purpose") == "2fa_pending":
+            return jsonify({"error": "Invalid token"}), 401
+        db = SessionLocal()
+        try:
+            user = db.query(User).filter(User.id == payload.get("user_id")).first()
+            if not user or user.role == "deactivated":
+                return jsonify({"error": "Unauthorized"}), 401
+            g.user_id = user.id
+            g.user_role = user.role
         finally:
             db.close()
         return f(*args, **kwargs)
@@ -179,9 +208,83 @@ def delete_test(test_id):
 
         db.query(Question).filter(Question.test_id == test_id).delete()
         db.query(Assignment).filter(Assignment.test_id == test_id).delete()
+        db.query(TestUnlock).filter(TestUnlock.test_id == test_id).delete()
         db.delete(test)
         db.commit()
         return jsonify({"success": True})
+    finally:
+        db.close()
+
+
+# ── GET/PUT /admin/tests/<test_id>/unlocks ────────────────────────────────────
+
+def _unlocked_students(db, test_id):
+    rows = (
+        db.query(TestUnlock, User)
+        .join(User, User.id == TestUnlock.user_id)
+        .filter(TestUnlock.test_id == test_id)
+        .order_by(User.username)
+        .all()
+    )
+    return [{
+        "id": user.id,
+        "name": user.username,
+        "email": user.email,
+        "unlockedAt": unlock.unlocked_at.isoformat() if unlock.unlocked_at else None,
+    } for unlock, user in rows]
+
+
+@admin_bp.route("/tests/<int:test_id>/unlocks", methods=["GET"])
+@require_admin
+def get_test_unlocks(test_id):
+    db = SessionLocal()
+    try:
+        if not db.query(Test).filter(Test.id == test_id).first():
+            return jsonify({"error": "Test not found"}), 404
+        return jsonify({"test_id": test_id, "students": _unlocked_students(db, test_id)})
+    finally:
+        db.close()
+
+
+@admin_bp.route("/tests/<int:test_id>/unlocks", methods=["PUT"])
+@require_admin
+def set_test_unlocks(test_id):
+    """Replace the set of students who have this test unlocked with `user_ids`."""
+    data = request.get_json(silent=True) or {}
+    user_ids = data.get("user_ids")
+    if not isinstance(user_ids, list) or not all(isinstance(u, int) and not isinstance(u, bool) for u in user_ids):
+        return jsonify({"error": "user_ids must be a list of user ids"}), 400
+    wanted = set(user_ids)
+
+    db = SessionLocal()
+    try:
+        if not db.query(Test).filter(Test.id == test_id).first():
+            return jsonify({"error": "Test not found"}), 404
+
+        students = {
+            u.id for u in db.query(User.id).filter(User.id.in_(wanted), User.role == "student").all()
+        } if wanted else set()
+        invalid = sorted(wanted - students)
+        if invalid:
+            return jsonify({"error": "Not student accounts", "user_ids": invalid}), 400
+
+        current = {
+            u.user_id for u in db.query(TestUnlock.user_id).filter(TestUnlock.test_id == test_id).all()
+        }
+        removed = current - wanted
+        if removed:
+            db.query(TestUnlock).filter(
+                TestUnlock.test_id == test_id, TestUnlock.user_id.in_(removed)
+            ).delete(synchronize_session=False)
+        for user_id in wanted - current:
+            db.add(TestUnlock(user_id=user_id, test_id=test_id))
+        try:
+            db.commit()
+        except IntegrityError:
+            db.rollback()
+            return jsonify({"error": "Unlocks were changed at the same time — reload and try again"}), 409
+
+        return jsonify({"test_id": test_id, "students": _unlocked_students(db, test_id)})
     finally:
         db.close()
 

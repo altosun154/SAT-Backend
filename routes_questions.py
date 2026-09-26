@@ -1,6 +1,6 @@
-from flask import Blueprint, jsonify, request
-from database import SessionLocal, Question, Test
-from admin import require_admin
+from flask import Blueprint, g, jsonify, request
+from database import SessionLocal, Question, Test, TestUnlock, Assignment
+from admin import require_admin, require_login
 
 questions_bp = Blueprint("questions", __name__)
 
@@ -66,11 +66,56 @@ def get_tests():
         db.close()
 
 
-@questions_bp.route("/tests/<int:test_id>/questions", methods=["GET"])
-def get_test_questions(test_id):
-    """Return all questions for a specific test, optionally filtered by variant (easy/hard)."""
+@questions_bp.route("/tests/unlocked", methods=["GET"])
+@require_login
+def get_unlocked_tests():
+    """Return the tests the logged-in student has unlocked."""
     db = SessionLocal()
     try:
+        tests = (
+            db.query(Test)
+            .join(TestUnlock, TestUnlock.test_id == Test.id)
+            .filter(TestUnlock.user_id == g.user_id)
+            .order_by(Test.id)
+            .all()
+        )
+        return jsonify([
+            {
+                "id": t.id,
+                "title": t.title,
+                "description": t.description
+            }
+            for t in tests
+        ])
+    finally:
+        db.close()
+
+
+def _can_take_test(db, user_id, role, test_id):
+    """Admins can open any test; students need it unlocked or assigned."""
+    if role == "admin":
+        return True
+    unlocked = db.query(TestUnlock.id).filter(
+        TestUnlock.user_id == user_id, TestUnlock.test_id == test_id
+    ).first()
+    if unlocked:
+        return True
+    assigned = db.query(Assignment.id).filter(
+        Assignment.user_id == user_id, Assignment.test_id == test_id
+    ).first()
+    return assigned is not None
+
+
+@questions_bp.route("/tests/<int:test_id>/questions", methods=["GET"])
+@require_login
+def get_test_questions(test_id):
+    """Return all questions for a specific test, optionally filtered by variant (easy/hard).
+    Only for admins and students who have the test unlocked or assigned."""
+    db = SessionLocal()
+    try:
+        if not _can_take_test(db, g.user_id, g.user_role, test_id):
+            return jsonify({"error": "This test is locked"}), 403
+
         query = db.query(Question).filter(Question.test_id == test_id)
 
         variant = request.args.get("variant")

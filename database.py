@@ -110,6 +110,18 @@ class Assignment(Base):
     due_date = Column(DateTime, nullable=True)
 
 
+class TestUnlock(Base):
+    """A test a student is allowed to take on their own (without an assignment)."""
+    __tablename__ = "test_unlocks"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    test_id = Column(Integer, ForeignKey("tests.id"), nullable=False, index=True)
+    unlocked_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+    __table_args__ = (UniqueConstraint("user_id", "test_id", name="uq_test_unlock"),)
+
+
 class Response(Base):
     __tablename__ = "user_responses"
     
