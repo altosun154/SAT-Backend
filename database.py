@@ -184,6 +184,20 @@ class ParseDraft(Base):
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 
+class TestDraft(Base):
+    """An imported practice test awaiting admin review (Upload Test flow). Kept
+    separate from ParseDraft, which belongs to the question-bank importer.
+    Publishing turns it into Test + Question rows and deletes the draft."""
+    __tablename__ = "test_drafts"
+
+    id = Column(String(36), primary_key=True)  # UUID
+    test_name = Column(String(200), nullable=False)
+    original_filename = Column(String(500), nullable=True)
+    questions_json = Column(Text, nullable=False)  # list of parse_test_file question dicts
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+
 def get_db():
     db = SessionLocal()
     try:

@@ -1,12 +1,14 @@
+import json
 import os
 import tempfile
+import uuid
 import jwt
 from datetime import datetime, timezone, timedelta
 from functools import wraps
 from flask import Blueprint, g, jsonify, request
 from sqlalchemy.exc import IntegrityError
-from database import SessionLocal, User, Test, Assignment, Response, Question, TestUnlock
-from test_file_parser import parse_test_file
+from database import SessionLocal, User, Test, Assignment, Response, Question, TestUnlock, TestDraft
+from test_file_parser import SUBJECT_MAP, parse_test_file
 
 ALLOWED_TEST_UPLOAD_EXTENSIONS = (".pdf", ".docx")
 
@@ -516,18 +518,19 @@ def reactivate_user(user_id):
         db.close()
 
 
-# ── POST /admin/upload-test ───────────────────────────────────────────────────
+# ── Test file import helpers ──────────────────────────────────────────────────
 
-@admin_bp.route("/upload-test", methods=["POST"])
-@require_admin
-def upload_test():
+def _parse_uploaded_test():
+    """Parse the uploaded test file in request.files["file"]. Returns
+    (test_name, questions, filename, None) on success, or
+    (None, None, None, error_response) on failure."""
     file = request.files.get("file")
     if not file or not file.filename:
-        return jsonify({"error": "file is required (multipart/form-data, field name 'file')"}), 400
+        return None, None, None, (jsonify({"error": "file is required (multipart/form-data, field name 'file')"}), 400)
 
     ext = os.path.splitext(file.filename)[1].lower()
     if ext not in ALLOWED_TEST_UPLOAD_EXTENSIONS:
-        return jsonify({"error": "Only .pdf and .docx files are supported"}), 400
+        return None, None, None, (jsonify({"error": "Only .pdf and .docx files are supported"}), 400)
 
     with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
         file.save(tmp.name)
@@ -536,9 +539,9 @@ def upload_test():
     try:
         data = parse_test_file(tmp_path, original_filename=file.filename)
     except ValueError as e:
-        return jsonify({"error": str(e)}), 400
+        return None, None, None, (jsonify({"error": str(e)}), 400)
     except Exception as e:
-        return jsonify({"error": f"Could not parse this file: {e}"}), 400
+        return None, None, None, (jsonify({"error": f"Could not parse this file: {e}"}), 400)
     finally:
         os.remove(tmp_path)
 
@@ -546,34 +549,51 @@ def upload_test():
     questions = data.get("questions", [])
 
     if not test_name:
-        return jsonify({"error": "Could not determine a test name from the uploaded file"}), 400
+        return None, None, None, (jsonify({"error": "Could not determine a test name from the uploaded file"}), 400)
     if not questions:
-        return jsonify({"error": "No questions could be parsed from the uploaded file"}), 400
+        return None, None, None, (jsonify({"error": "No questions could be parsed from the uploaded file"}), 400)
+    return test_name, questions, file.filename, None
+
+
+def _add_test_with_questions(db, test_name, questions):
+    """Add a Test and its Question rows to the session (caller commits)."""
+    test = Test(title=test_name)
+    db.add(test)
+    db.flush()
+
+    for q in questions:
+        db.add(Question(
+            test_id=test.id,
+            text=q.get("text") or "",
+            choice_a=q.get("choice_a") or "",
+            choice_b=q.get("choice_b") or "",
+            choice_c=q.get("choice_c") or "",
+            choice_d=q.get("choice_d") or "",
+            correct_answer=q.get("correct_answer") or "",
+            subject=q.get("subject"),
+            difficulty=q.get("difficulty") or None,
+            passage=q.get("passage") or None,
+            image_url=q.get("image_url") or None,
+            skill=q.get("skill") or None,
+            explanation=q.get("explanation") or None,
+            module_variant=q.get("module_variant") or None,
+        ))
+    return test
+
+
+# ── POST /admin/upload-test ───────────────────────────────────────────────────
+# Imports straight to the DB. Superseded by the /admin/test-drafts review flow.
+
+@admin_bp.route("/upload-test", methods=["POST"])
+@require_admin
+def upload_test():
+    test_name, questions, _, error = _parse_uploaded_test()
+    if error:
+        return error
 
     db = SessionLocal()
     try:
-        test = Test(title=test_name)
-        db.add(test)
-        db.flush()
-
-        for q in questions:
-            db.add(Question(
-                test_id=test.id,
-                text=q.get("text", ""),
-                choice_a=q.get("choice_a", ""),
-                choice_b=q.get("choice_b", ""),
-                choice_c=q.get("choice_c", ""),
-                choice_d=q.get("choice_d", ""),
-                correct_answer=q.get("correct_answer", ""),
-                subject=q.get("subject"),
-                difficulty=q.get("difficulty"),
-                passage=q.get("passage"),
-                image_url=q.get("image_url"),
-                skill=q.get("skill"),
-                explanation=q.get("explanation"),
-                module_variant=q.get("module_variant"),
-            ))
-
+        test = _add_test_with_questions(db, test_name, questions)
         db.commit()
         return jsonify({
             "success": True,
@@ -584,5 +604,232 @@ def upload_test():
     except Exception as e:
         db.rollback()
         return jsonify({"error": str(e)}), 500
+    finally:
+        db.close()
+
+
+# ── Test drafts (review before publish) ───────────────────────────────────────
+
+VALID_SUBJECTS = set(SUBJECT_MAP.values())
+VALID_DIFFICULTIES = {"easy", "medium", "hard"}
+CHOICE_KEYS = ("choice_a", "choice_b", "choice_c", "choice_d")
+MAX_ANSWER_LENGTH = 10  # Question.correct_answer is String(10)
+
+
+def _iso(dt):
+    return dt.isoformat() if dt else None
+
+
+def _draft_json(draft):
+    return {
+        "id": draft.id,
+        "test_name": draft.test_name,
+        "filename": draft.original_filename,
+        "created_at": _iso(draft.created_at),
+        "updated_at": _iso(draft.updated_at),
+        "questions": json.loads(draft.questions_json),
+    }
+
+
+def _text(value):
+    """A draft field as stripped text; drafts are saved unvalidated, so any
+    field may be missing, null or a non-string."""
+    return "" if value is None else str(value).strip()
+
+
+def _validate_draft(test_name, questions):
+    """Check a draft is publishable. Returns (problems, cleaned_questions), where
+    cleaned questions have stripped text, an uppercased multiple-choice answer
+    and a lowercased difficulty."""
+    problems = []
+
+    def problem(index, field, message):
+        problems.append({"index": index, "field": field, "message": message})
+
+    if not _text(test_name):
+        problem(None, "test_name", "Test name is required.")
+    if not questions:
+        problem(None, "questions", "The test has no questions.")
+
+    cleaned = []
+    for i, q in enumerate(questions):
+        if not isinstance(q, dict):
+            problem(i, "question", "Question data is malformed.")
+            continue
+        q = dict(q)
+
+        if not _text(q.get("text")):
+            problem(i, "text", "Question text is required.")
+        if q.get("subject") not in VALID_SUBJECTS:
+            problem(i, "subject", "Subject must be one of: " + ", ".join(SUBJECT_MAP.values()) + ".")
+
+        answer = _text(q.get("correct_answer"))
+        choices = [_text(q.get(k)) for k in CHOICE_KEYS]
+        if not answer:
+            problem(i, "correct_answer", "Correct answer is required.")
+        elif any(choices):
+            for key, choice in zip(CHOICE_KEYS, choices):
+                if not choice:
+                    problem(i, key, f"Choice {key[-1].upper()} is empty; a multiple-choice question needs all four choices.")
+            answer = answer.upper()
+            if answer not in ("A", "B", "C", "D"):
+                problem(i, "correct_answer", "A multiple-choice answer must be A, B, C or D.")
+        if len(answer) > MAX_ANSWER_LENGTH:
+            problem(i, "correct_answer", f"Correct answer can be at most {MAX_ANSWER_LENGTH} characters.")
+        q["correct_answer"] = answer
+
+        difficulty = _text(q.get("difficulty")).lower()
+        if difficulty and difficulty not in VALID_DIFFICULTIES:
+            problem(i, "difficulty", "Difficulty must be easy, medium or hard (or left empty).")
+        q["difficulty"] = difficulty or None
+
+        cleaned.append(q)
+    return problems, cleaned
+
+
+# ── POST /admin/test-drafts ───────────────────────────────────────────────────
+
+@admin_bp.route("/test-drafts", methods=["POST"])
+@require_admin
+def create_test_draft():
+    test_name, questions, filename, error = _parse_uploaded_test()
+    if error:
+        return error
+
+    db = SessionLocal()
+    try:
+        now = datetime.now(timezone.utc)
+        draft = TestDraft(
+            id=str(uuid.uuid4()),
+            test_name=test_name,
+            original_filename=filename,
+            questions_json=json.dumps(questions),
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(draft)
+        db.commit()
+        return jsonify(_draft_json(draft)), 201
+    except Exception as e:
+        db.rollback()
+        return jsonify({"error": str(e)}), 500
+    finally:
+        db.close()
+
+
+# ── GET /admin/test-drafts ────────────────────────────────────────────────────
+
+@admin_bp.route("/test-drafts", methods=["GET"])
+@require_admin
+def list_test_drafts():
+    db = SessionLocal()
+    try:
+        drafts = db.query(TestDraft).order_by(TestDraft.updated_at.desc()).all()
+        return jsonify([{
+            "id": d.id,
+            "test_name": d.test_name,
+            "filename": d.original_filename,
+            "question_count": len(json.loads(d.questions_json)),
+            "created_at": _iso(d.created_at),
+            "updated_at": _iso(d.updated_at),
+        } for d in drafts])
+    finally:
+        db.close()
+
+
+# ── GET /admin/test-drafts/<id> ───────────────────────────────────────────────
+
+@admin_bp.route("/test-drafts/<draft_id>", methods=["GET"])
+@require_admin
+def get_test_draft(draft_id):
+    db = SessionLocal()
+    try:
+        draft = db.get(TestDraft, draft_id)
+        if not draft:
+            return jsonify({"error": "Draft not found"}), 404
+        return jsonify(_draft_json(draft))
+    finally:
+        db.close()
+
+
+# ── PUT /admin/test-drafts/<id> ───────────────────────────────────────────────
+# Saves work in progress as-is; validation happens at publish.
+
+@admin_bp.route("/test-drafts/<draft_id>", methods=["PUT"])
+@require_admin
+def update_test_draft(draft_id):
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return jsonify({"error": "Request body must be a JSON object"}), 400
+    questions = body.get("questions")
+    if not isinstance(questions, list):
+        return jsonify({"error": "questions must be a list"}), 400
+
+    db = SessionLocal()
+    try:
+        draft = db.get(TestDraft, draft_id)
+        if not draft:
+            return jsonify({"error": "Draft not found"}), 404
+        # test_name is NOT NULL and String(200); store what fits, publish validates it.
+        draft.test_name = _text(body.get("test_name"))[:200]
+        draft.questions_json = json.dumps(questions)
+        draft.updated_at = datetime.now(timezone.utc)
+        db.commit()
+        return jsonify(_draft_json(draft))
+    except Exception as e:
+        db.rollback()
+        return jsonify({"error": str(e)}), 500
+    finally:
+        db.close()
+
+
+# ── POST /admin/test-drafts/<id>/publish ──────────────────────────────────────
+
+@admin_bp.route("/test-drafts/<draft_id>/publish", methods=["POST"])
+@require_admin
+def publish_test_draft(draft_id):
+    db = SessionLocal()
+    try:
+        draft = db.get(TestDraft, draft_id)
+        if not draft:
+            return jsonify({"error": "Draft not found"}), 404
+
+        test_name = _text(draft.test_name)
+        problems, questions = _validate_draft(test_name, json.loads(draft.questions_json))
+        if problems:
+            return jsonify({
+                "error": f"Fix {len(problems)} problem(s) before publishing",
+                "problems": problems,
+            }), 422
+
+        test = _add_test_with_questions(db, test_name, questions)
+        db.delete(draft)
+        db.commit()
+        return jsonify({
+            "success": True,
+            "test_id": test.id,
+            "test_name": test_name,
+            "questions_added": len(questions),
+        }), 201
+    except Exception as e:
+        db.rollback()
+        return jsonify({"error": str(e)}), 500
+    finally:
+        db.close()
+
+
+# ── DELETE /admin/test-drafts/<id> ────────────────────────────────────────────
+
+@admin_bp.route("/test-drafts/<draft_id>", methods=["DELETE"])
+@require_admin
+def delete_test_draft(draft_id):
+    db = SessionLocal()
+    try:
+        draft = db.get(TestDraft, draft_id)
+        if not draft:
+            return jsonify({"error": "Draft not found"}), 404
+        db.delete(draft)
+        db.commit()
+        return jsonify({"success": True})
     finally:
         db.close()

@@ -70,6 +70,8 @@ UPLOAD_WORKERS = 8  # concurrent image uploads to storage
 # camelCase/number-smashed words for readability, and drops a small set of
 # filler words that show up as pure noise across known templates.
 _COPY_PREFIX_RE = re.compile(r"^copy(?:\s*\(\d+\))?\s+of\s+", re.IGNORECASE)
+# Browsers save a repeat download of "x.pdf" as "x (1).pdf".
+_DUPLICATE_SUFFIX_RE = re.compile(r"\s*\(\d+\)$")
 _CAMEL_BOUNDARY_RE = re.compile(r"(?<=[a-z])(?=[A-Z])")
 _LETTER_DIGIT_BOUNDARY_RE = re.compile(r"(?<=[A-Za-z])(?=\d)|(?<=\d)(?=[A-Za-z])")
 _NAME_NOISE_WORDS = {"annotated", "difficulty"}
@@ -524,6 +526,7 @@ def _parse_answer_keys(items):
 def _clean_test_name_from_filename(filename):
     base = os.path.splitext(filename)[0]
     base = base.rstrip(". ")
+    base = _DUPLICATE_SUFFIX_RE.sub("", base)
     base = _COPY_PREFIX_RE.sub("", base).strip()
     base = base.replace("_", " ").replace("-", " ")
     base = _CAMEL_BOUNDARY_RE.sub(" ", base)
