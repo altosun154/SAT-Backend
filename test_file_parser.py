@@ -2,10 +2,10 @@ import io
 import os
 import re
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from typing import Callable, Optional
 
-import pdfplumber
 import pymupdf
 from PIL import Image
 from docx import Document
@@ -15,7 +15,9 @@ from docx.text.paragraph import Paragraph
 
 import supabase_storage
 
-SECTION_RE = re.compile(r"^(Reading and Writing|Math)\s*[—-]\s*Module\s*([12])\s*$", re.IGNORECASE)
+# Word autocorrects " - " to an en dash, so headings may use em dash, en dash or hyphen.
+DASH = r"[—–-]"
+SECTION_RE = re.compile(rf"^(Reading and Writing|Math)\s*{DASH}\s*Module\s*([12])\s*$", re.IGNORECASE)
 # Difficulty tags appear either bracketed ("[EASY]") or as a bare word inside a
 # badge/pill shape with no brackets in the underlying text layer ("EASY") — both
 # templates are in use, so brackets are optional here. Some templates also tack an
@@ -38,8 +40,8 @@ ANSWER_KEYS_RE = re.compile(r"^Answer\s+Keys?\b", re.IGNORECASE)
 # Some templates append a bubble-sheet appendix after the real answer key/explanations;
 # per explicit instruction, that section is never used as an answer source — stop there.
 BUBBLE_SUMMARY_RE = re.compile(r"Bubble\s+Summary", re.IGNORECASE)
-RW_ANSWER_HEADER_RE = re.compile(r"Reading and Writing\s*[—-]\s*Answer Key", re.IGNORECASE)
-MATH_ANSWER_HEADER_RE = re.compile(r"Math\s*[—-]\s*Answer Key", re.IGNORECASE)
+RW_ANSWER_HEADER_RE = re.compile(rf"Reading and Writing\s*{DASH}\s*Answer Key", re.IGNORECASE)
+MATH_ANSWER_HEADER_RE = re.compile(rf"Math\s*{DASH}\s*Answer Key", re.IGNORECASE)
 MODULE_HEADING_RE = re.compile(r"^Module\s*([12])\s*$", re.IGNORECASE)
 # Answer-key entry line, used for both subjects: "N. B — explanation", "N. B.
 # explanation" (multiple choice), or "N. 4. explanation" / "N. -2. explanation"
@@ -62,6 +64,7 @@ VISUAL_PADDING = 4
 # How far above a table its caption/title line can sit, in pt.
 TABLE_CAPTION_GAP = 12
 VISUAL_STACK_GAP = 24  # px between visuals stacked into one question image
+UPLOAD_WORKERS = 8  # concurrent image uploads to storage
 
 # Filename → test name cleanup: strips OS duplicate-file prefixes, formats
 # camelCase/number-smashed words for readability, and drops a small set of
@@ -153,61 +156,89 @@ def _is_table_caption(line, table):
     )
 
 
-def extract_items_from_pdf(pdf_path, doc, y_tolerance=3):
+def _pdf_words(page, x_tolerance=3):
+    """Words on `page` with their bbox and font, in the shape pdfplumber's
+    extract_words(extra_attrs=["fontname"]) returns. Built from PyMuPDF's
+    per-character output (C code) rather than pdfplumber, whose pure-Python
+    parsing took ~2/3 of the import time on a 45-page test — long enough to hit
+    the server's request timeout. A word breaks at whitespace or a horizontal gap
+    wider than `x_tolerance`, and can span font changes (e.g. bold "A)" + text)."""
+    words = []
+    # Text only: rawdict otherwise carries every image on the page, decoded.
+    flags = pymupdf.TEXTFLAGS_RAWDICT & ~pymupdf.TEXT_PRESERVE_IMAGES
+    for block in page.get_text("rawdict", flags=flags)["blocks"]:
+        for line in block.get("lines", []):
+            current = None
+            for span in line["spans"]:
+                for ch in span["chars"]:
+                    c = ch["c"]
+                    x0, top, x1, bottom = ch["bbox"]
+                    if c.isspace():
+                        current = None
+                        continue
+                    if current is None or x0 - current["x1"] > x_tolerance:
+                        current = {"text": "", "x0": x0, "x1": x1, "top": top,
+                                   "bottom": bottom, "fontname": span["font"]}
+                        words.append(current)
+                    current["text"] += c
+                    current["x1"] = max(current["x1"], x1)
+                    current["bottom"] = max(current["bottom"], bottom)
+    return words
+
+
+def extract_items_from_pdf(doc, y_tolerance=3):
     """Return the document as Lines and Visuals in reading order. Text lines are
     reconstructed per page by clustering words with similar vertical position,
     since raw PDF content-stream order can interleave absolutely-positioned labels
-    (like difficulty tags) with body text. `doc` is the same file opened with
-    PyMuPDF, used for figures/tables; it must stay open until they're rendered."""
+    (like difficulty tags) with body text. `doc` is the file opened with PyMuPDF;
+    it must stay open until the figures/tables are rendered."""
     visual_rects, decoration_sizes = _pdf_visual_rects(doc)
     items = []
-    with pdfplumber.open(pdf_path) as pdf:
-        for page_num, (page, (figures, tables)) in enumerate(zip(pdf.pages, visual_rects)):
-            words = page.extract_words(extra_attrs=["fontname"])
-            clusters = []
-            for w in sorted(words, key=lambda w: (w["top"], w["x0"])):
-                for c in clusters:
-                    if abs(c["top"] - w["top"]) <= y_tolerance:
-                        c["words"].append(w)
-                        break
-                else:
-                    clusters.append({"top": w["top"], "words": [w]})
-
-            lines = []
+    for page_num, (page, (figures, tables)) in enumerate(zip(doc, visual_rects)):
+        words = _pdf_words(page)
+        clusters = []
+        for w in sorted(words, key=lambda w: (w["top"], w["x0"])):
             for c in clusters:
-                ws = sorted(c["words"], key=lambda w: w["x0"])
-                text = " ".join(w["text"] for w in ws).strip()
-                if not text or BOILERPLATE_RE.match(text):
-                    continue
-                total_chars = sum(len(w["text"]) for w in ws)
-                italic_chars = sum(len(w["text"]) for w in ws if _is_italic_font(w["fontname"]))
-                lines.append({
-                    "text": text, "top": c["top"], "bottom": max(w["bottom"] for w in ws),
-                    "x0": ws[0]["x0"], "x1": ws[-1]["x1"], "words": ws,
-                    "italic": italic_chars * 2 > total_chars,
-                })
+                if abs(c["top"] - w["top"]) <= y_tolerance:
+                    c["words"].append(w)
+                    break
+            else:
+                clusters.append({"top": w["top"], "words": [w]})
 
-            for i, table in enumerate(tables):
-                for line in lines:
-                    if _is_table_caption(line, table):
-                        tables[i] = table = table | pymupdf.Rect(line["x0"], line["top"], line["x1"], line["bottom"])
+        lines = []
+        for c in clusters:
+            ws = sorted(c["words"], key=lambda w: w["x0"])
+            text = " ".join(w["text"] for w in ws).strip()
+            if not text or BOILERPLATE_RE.match(text):
+                continue
+            total_chars = sum(len(w["text"]) for w in ws)
+            italic_chars = sum(len(w["text"]) for w in ws if _is_italic_font(w["fontname"]))
+            lines.append({
+                "text": text, "top": c["top"], "bottom": max(w["bottom"] for w in ws),
+                "x0": ws[0]["x0"], "x1": ws[-1]["x1"], "words": ws,
+                "italic": italic_chars * 2 > total_chars,
+            })
 
-            positioned = [(r.y0, Visual(_pdf_renderer(doc[page_num], r, decoration_sizes))) for r in figures + tables]
+        for i, table in enumerate(tables):
             for line in lines:
-                ws = line["words"]
-                in_table = sum(
-                    1 for w in ws
-                    if any(t.contains(pymupdf.Point((w["x0"] + w["x1"]) / 2, (w["top"] + w["bottom"]) / 2))
-                           for t in tables)
-                ) * 2 > len(ws)
-                positioned.append((line["top"], Line(
-                    line["text"], italic=line["italic"],
-                    page=page_num, top=line["top"], in_table=in_table,
-                )))
+                if _is_table_caption(line, table):
+                    tables[i] = table = table | pymupdf.Rect(line["x0"], line["top"], line["x1"], line["bottom"])
 
-            positioned.sort(key=lambda p: p[0])
-            items.extend(item for _, item in positioned)
-            page.close()  # pdfplumber otherwise caches every page's objects until the file closes
+        positioned = [(r.y0, Visual(_pdf_renderer(doc[page_num], r, decoration_sizes))) for r in figures + tables]
+        for line in lines:
+            ws = line["words"]
+            in_table = sum(
+                1 for w in ws
+                if any(t.contains(pymupdf.Point((w["x0"] + w["x1"]) / 2, (w["top"] + w["bottom"]) / 2))
+                       for t in tables)
+            ) * 2 > len(ws)
+            positioned.append((line["top"], Line(
+                line["text"], italic=line["italic"],
+                page=page_num, top=line["top"], in_table=in_table,
+            )))
+
+        positioned.sort(key=lambda p: p[0])
+        items.extend(item for _, item in positioned)
 
     if not any(isinstance(i, Line) for i in items):
         raise ValueError(
@@ -367,6 +398,11 @@ def _parse_questions(items):
 
         m = QUESTION_RE.match(line)
         if m:
+            if section is None:
+                raise ValueError(
+                    f"Found \"{line}\" before any section heading. Each section must start "
+                    "with a heading like \"Reading and Writing — Module 1\" or \"Math — Module 2\"."
+                )
             flush()
             current_number = int(m.group(1))
             current_q = {"body": [], "choices": {}, "last_choice": None, "visuals": [],
@@ -464,8 +500,8 @@ def _parse_answer_keys(items):
             # "N. B — explanation" and grid-in "N. 4. explanation" put the
             # explanation inline; "N. B. Ancient" just echoes the choice text.
             rest = m.group(3).strip()
-            if rest[:1] in ("—", "-") or not value.isalpha():
-                rest = rest.lstrip("—- ").strip()
+            if rest[:1] in ("—", "–", "-") or not value.isalpha():
+                rest = rest.lstrip("—–- ").strip()
                 if rest:
                     explanations[key][num] = rest
             continue
@@ -513,13 +549,28 @@ def _combine_pngs(pngs):
     return buf.getvalue()
 
 
-def _upload_visuals(visuals, upload_image):
-    """Render a question's figures/tables into one PNG and upload it. Returns the
-    public URL, or None if there's nothing to show or the upload isn't possible."""
+def _render_visuals(visuals):
+    """Render a question's figures/tables into one PNG, or None if there's nothing to show."""
     pngs = [png for png in (v.render() for v in visuals) if png]
-    if not pngs:
-        return None
-    return upload_image(_combine_pngs(pngs), ext="png", content_type="image/png")
+    return _combine_pngs(pngs) if pngs else None
+
+
+def _upload_question_images(questions, upload_image):
+    """Render every question's visuals (sequentially — PyMuPDF isn't thread-safe),
+    then upload them in parallel: one at a time, ~20 uploads were a large share of
+    the request time. A failed upload leaves image_url as None."""
+    pending = []
+    for q in questions:
+        visuals = q.pop("visuals")
+        png = _render_visuals(visuals) if visuals else None
+        if png:
+            pending.append((q, png))
+    if not pending:
+        return
+    with ThreadPoolExecutor(max_workers=UPLOAD_WORKERS) as pool:
+        urls = pool.map(lambda item: upload_image(item[1], ext="png", content_type="image/png"), pending)
+        for (q, _), url in zip(pending, urls):
+            q["image_url"] = url
 
 
 def _parse_lines(items, original_filename=None, upload_image=None):
@@ -554,17 +605,14 @@ def _parse_lines(items, original_filename=None, upload_image=None):
         details = ", ".join(f"{k[0]} Module {k[1]} Q{n}" for k, n in missing_answers)
         raise ValueError(f"Could not find answer-key entries for: {details}")
 
-    for q in questions:
-        visuals = q.pop("visuals")
-        if visuals:
-            q["image_url"] = _upload_visuals(visuals, upload_image)
+    _upload_question_images(questions, upload_image)
 
     return {"test_name": test_name, "questions": questions}
 
 
 def parse_pdf(pdf_path, original_filename=None, upload_image=None):
     with pymupdf.open(pdf_path) as doc:
-        items = extract_items_from_pdf(pdf_path, doc)
+        items = extract_items_from_pdf(doc)
         return _parse_lines(items, original_filename or os.path.basename(pdf_path), upload_image)
 
 

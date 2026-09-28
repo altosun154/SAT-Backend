@@ -537,6 +537,8 @@ def upload_test():
         data = parse_test_file(tmp_path, original_filename=file.filename)
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"error": f"Could not parse this file: {e}"}), 400
     finally:
         os.remove(tmp_path)
 
