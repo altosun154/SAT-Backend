@@ -191,6 +191,7 @@ def get_test_questions(test_id):
             "passage": q.passage,
             "image_url": q.image_url,
             "skill": q.skill,
+            "explanation": q.explanation,
             "module_variant": q.module_variant,
         } for q in questions])
     finally:
@@ -306,7 +307,7 @@ def update_question(question_id):
         updatable_fields = [
             "text", "choice_a", "choice_b", "choice_c", "choice_d",
             "correct_answer", "subject", "difficulty", "passage",
-            "image_url", "skill", "module_variant",
+            "image_url", "skill", "explanation", "module_variant",
         ]
         for field in updatable_fields:
             if field in data:
