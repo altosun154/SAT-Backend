@@ -1,5 +1,6 @@
 from flask import Blueprint, jsonify, request
-from database import SessionLocal, Question, Response, TestCompletion
+from database import SessionLocal, Question, Response, TestCompletion, TestScore
+from grading import answers_match
 
 results_bp = Blueprint("results", __name__)
 
@@ -81,6 +82,13 @@ def get_results_history():
             rw_score = round(200 + (rw_correct / rw_total) * 600) if rw_total > 0 else None
             total_score = (math_score + rw_score) if math_score is not None and rw_score is not None else None
 
+            # Prefer IRT-computed scores when available
+            irt = db.query(TestScore).filter_by(session_id=c.session_id).first()
+            if irt:
+                math_score = irt.math_score if irt.math_score is not None else math_score
+                rw_score = irt.rw_score if irt.rw_score is not None else rw_score
+                total_score = irt.total_score if irt.total_score is not None else total_score
+
             history.append({
                 "session_id": c.session_id,
                 "test_id": c.test_id,
@@ -91,6 +99,8 @@ def get_results_history():
                 "math_score": math_score,
                 "rw_score": rw_score,
                 "total_score": total_score,
+                "math_band": irt.math_band if irt else None,
+                "rw_band": irt.rw_band if irt else None,
                 "skill_breakdown": skill_breakdown,
             })
 
@@ -117,7 +127,7 @@ def submit_review_answer():
         if not question:
             return jsonify({"error": "Question not found"}), 404
 
-        is_correct = question.correct_answer.upper() == selected.upper()
+        is_correct = answers_match(selected, question.correct_answer)
 
         db.add(Response(
             user_id=user_id,
@@ -196,6 +206,17 @@ def get_results():
         rw_score = round(200 + (rw_correct / rw_total) * 600) if rw_total > 0 else None
         total_score = (math_score + rw_score) if math_score and rw_score else None
 
+        # Prefer IRT-computed scores when available
+        math_band = rw_band = None
+        if session_id:
+            irt = db.query(TestScore).filter_by(session_id=session_id).first()
+            if irt:
+                math_score = irt.math_score if irt.math_score is not None else math_score
+                rw_score = irt.rw_score if irt.rw_score is not None else rw_score
+                total_score = irt.total_score if irt.total_score is not None else total_score
+                math_band = irt.math_band
+                rw_band = irt.rw_band
+
         return jsonify({
             "test_id": test_id,
             "user_id": user_id,
@@ -207,6 +228,8 @@ def get_results():
             "math_score": math_score,
             "rw_score": rw_score,
             "total_score": total_score,
+            "math_band": math_band,
+            "rw_band": rw_band,
             "percentile": None,
             "by_subject": subjects,
             "by_skill": by_skill

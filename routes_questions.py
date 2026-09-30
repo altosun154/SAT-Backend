@@ -53,7 +53,8 @@ def get_tests():
     """Return all practice tests."""
     db = SessionLocal()
     try:
-        tests = db.query(Test).all()
+        # unpublished tests (e.g. adaptive Module 2 not built yet) are hidden from students
+        tests = db.query(Test).filter(Test.is_published.isnot(False)).order_by(Test.id).all()
         return jsonify([
             {
                 "id": t.id,
@@ -109,8 +110,13 @@ def _can_take_test(db, user_id, role, test_id):
 @questions_bp.route("/tests/<int:test_id>/questions", methods=["GET"])
 @require_login
 def get_test_questions(test_id):
-    """Return all questions for a specific test, optionally filtered by variant (easy/hard).
-    Only for admins and students who have the test unlocked or assigned."""
+    """Return all questions for a specific test, optionally filtered by variant.
+
+    ?variant=easy|hard  only that Module 2 version
+    ?variant=none       only questions without a variant (Module 1s, and Module 2s of
+                        non-adaptive tests); the adaptive Module 2 is then fetched with
+                        POST /tests/<id>/module2 after Module 1 is finished.
+    """
     db = SessionLocal()
     try:
         if not _can_take_test(db, g.user_id, g.user_role, test_id):
@@ -119,10 +125,12 @@ def get_test_questions(test_id):
         query = db.query(Question).filter(Question.test_id == test_id)
 
         variant = request.args.get("variant")
-        if variant:
+        if variant == "none":
+            query = query.filter(Question.module_variant.is_(None))
+        elif variant:
             query = query.filter(Question.module_variant == variant)
 
-        questions = query.all()
+        questions = query.order_by(Question.id).all()
         return jsonify([
             {
                 "id": q.id,
@@ -134,6 +142,7 @@ def get_test_questions(test_id):
                 "subject": q.subject,
                 "difficulty": q.difficulty,
                 "module_variant": q.module_variant,
+                "question_type": q.question_type or "mcq",
                 "skill": q.skill,
                 "passage": q.passage,
                 "image_url": q.image_url

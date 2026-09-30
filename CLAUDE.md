@@ -36,8 +36,9 @@ This is a flat-file Flask backend — all Python modules live at the root, with 
 
 **Models and their relationships**:
 - `User` — roles: `"student"`, `"admin"`, `"parent"`, `"deactivated"`
-- `Test` → `Question` (one-to-many via `question.test_id`)
-- `Question` — has `module_variant` (`"easy"` or `"hard"`) for adaptive Module 2 routing; `subject` encodes the full section name (e.g. `"Section 2, Module 1: Math"`)
+- `Test` → `Question` (one-to-many via `question.test_id`); `Test.is_published` = False hides a test that isn't complete yet (e.g. adaptive Module 2 not built)
+- `Question` — has `module_variant` (`"easy"` = Lower Module 2, `"hard"` = Higher Module 2) for adaptive routing; `subject` encodes the full section name (e.g. `"Section 2, Module 1: Math"`); `question_type` is `"mcq"` or `"free_response"` (typed math answer, choices are empty strings); `source_key`/`pool_question_id` trace imported and pool-built questions
+- `PoolQuestion` (`module2_pool_questions`) — shared pool of Module 2 questions; `used_in_test_id` is empty while unused. See [ADAPTIVE_TESTS.md](ADAPTIVE_TESTS.md)
 - `Response` — records every answer attempt; `session_id` ties a test-taking session together
 - `TestCompletion` — written once per finished test session (triggers score calculation on read)
 - `PracticeResponse` — for topic-drill activity (separate from full test `Response`)
@@ -51,11 +52,13 @@ This is a flat-file Flask backend — all Python modules live at the root, with 
 - `admin.admin_bp` (`/admin`) — admin-only endpoints guarded by `require_admin` decorator that validates a Bearer JWT and checks `user.role == "admin"`; user management, assignment CRUD
 - `activity.activity_bp` (no prefix) — `POST /activity` for logging login dates; requires Bearer JWT
 
-**Adaptive testing flow**: The frontend takes Module 1, calls `POST /adaptive/module2` with the score, and receives `"easy"` or `"hard"`. It then fetches `GET /tests/<id>/questions?variant=easy|hard` for Module 2. Threshold is 60% correct → hard.
+**Adaptive testing flow**: The frontend loads `GET /tests/<id>/questions?variant=none` (Module 1s). When a Module 1 is submitted it calls `POST /tests/<id>/module2` with `{section, answers}`; the backend grades Module 1 ([routes_adaptive.py](routes_adaptive.py)) and returns the Lower (`easy`) or Higher (`hard`) Module 2. Thresholds and difficulty mixes live in [adaptive.py](adaptive.py): 19/27 R&W, 16/22 Math. The older `POST /adaptive/module2` endpoint is still there but the practice test page no longer uses it. Answer checking (letters and typed math answers like `3/4` = `.75`) is in [grading.py](grading.py).
 
 **Scoring**: Math and R&W scores are each scaled 200–800 using `round(200 + (correct/total) * 600)`. Total score is their sum (400–1600). This calculation is inline in multiple route handlers (`routes.py` and `admin.py`) rather than centralized — if the formula needs to change, update it in both files.
 
 **Question images**: Stored in Supabase (`rgtpylhsewekyepcgxde.supabase.co/storage/v1/object/public/question-images`). The `BASE_URL` constant in `seed_questions.py` constructs `image_url` values. `rename_images.py` and `sync_images.py` are maintenance scripts for that bucket.
+
+**Adaptive practice tests from the client**: `python import_practice_tests.py` uploads the images, imports each test's Module 1, fills the Module 2 pool and builds Lower/Higher Module 2s with no question reused across tests. Data lives in `data/practice_tests/`. Check locally with `python smoke_test_adaptive.py` (throwaway SQLite). Details: [ADAPTIVE_TESTS.md](ADAPTIVE_TESTS.md).
 
 **Adding a new test**: Create a JSON file with `test_name` and a `questions` array (each question has the same fields as the `Question` model), then run `python add_test.py <file>`. The `sat_questions.json` file is an example of this format.
 

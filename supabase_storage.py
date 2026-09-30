@@ -13,7 +13,7 @@ def is_configured():
     return bool(SERVICE_KEY)
 
 
-def upload_image(image_bytes, ext="png", content_type="image/png"):
+def upload_image(image_bytes, ext="png", content_type="image/png", path=None, upsert=False):
     """Upload image bytes to the Supabase question-images bucket under a
     'parsed/' prefix. Returns the public URL, or None if no service key is
     configured or the upload fails for any reason — callers should treat
@@ -23,7 +23,9 @@ def upload_image(image_bytes, ext="png", content_type="image/png"):
     if not SERVICE_KEY:
         return None
 
-    filename = f"parsed/{uuid.uuid4().hex}.{ext}"
+    # path: fixed name inside the bucket (e.g. "practice-tests/t1_math_m1_q04.png");
+    # upsert: overwrite if it already exists, so re-running an import is safe.
+    filename = path or f"parsed/{uuid.uuid4().hex}.{ext}"
     try:
         resp = requests.post(
             f"{_STORAGE_BASE}/object/{BUCKET}/{filename}",
@@ -31,6 +33,7 @@ def upload_image(image_bytes, ext="png", content_type="image/png"):
                 "Authorization": f"Bearer {SERVICE_KEY}",
                 "apikey": SERVICE_KEY,
                 "Content-Type": content_type,
+                **({"x-upsert": "true"} if upsert else {}),
             },
             data=image_bytes,
             timeout=30,
