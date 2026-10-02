@@ -5,16 +5,27 @@ from grading import answers_match
 results_bp = Blueprint("results", __name__)
 
 
+def _empty_results():
+    return {
+        "has_data": False,
+        "correct": 0,
+        "incorrect": 0,
+        "skipped": 0,
+        "accuracy": None,
+        "skills": [],
+    }
+
+
 # --- Results ---
 
 @results_bp.route("/results/history", methods=["GET"])
 def get_results_history():
-    """Return all past test sessions for a user, ordered newest first."""
+    """Return all past test sessions for the logged-in user, newest first."""
     db = SessionLocal()
     try:
-        user_id = request.args.get("user_id")
+        user_id = require_user(request)
         if not user_id:
-            return jsonify({"error": "user_id is required"}), 400
+            return jsonify({"error": "Unauthorized"}), 401
 
         completions = db.query(TestCompletion).filter(
             TestCompletion.user_id == user_id
@@ -114,14 +125,17 @@ def submit_review_answer():
     """Store a new response row when a user re-answers a question during review."""
     db = SessionLocal()
     try:
+        user_id = require_user(request)
+        if not user_id:
+            return jsonify({"error": "Unauthorized"}), 401
+
         data = request.get_json()
-        user_id = data.get("user_id")
         test_id = data.get("test_id")
         question_id = data.get("question_id")
         selected = data.get("selected_answer")
 
-        if not all([user_id, test_id, question_id, selected]):
-            return jsonify({"error": "user_id, test_id, question_id, and selected_answer are required"}), 400
+        if not all([test_id, question_id, selected]):
+            return jsonify({"error": "test_id, question_id, and selected_answer are required"}), 400
 
         question = db.query(Question).filter(Question.id == question_id).first()
         if not question:
@@ -144,56 +158,63 @@ def submit_review_answer():
 
 @results_bp.route("/results", methods=["GET"])
 def get_results():
-    """Return score breakdown for a user and test."""
+    """Return score breakdown for the logged-in user's most recent completed
+    test session, or a specific one via test_id/session_id. Returns the
+    has_data=false shape below when there's no matching test_completions row —
+    never a default/placeholder score."""
     db = SessionLocal()
     try:
-        user_id = request.args.get("user_id")
+        user_id = require_user(request)
+        if not user_id:
+            return jsonify({"error": "Unauthorized"}), 401
+
         test_id = request.args.get("test_id")
         session_id = request.args.get("session_id")
 
-        query = db.query(Response).filter(
-            Response.user_id == user_id,
-            Response.test_id == test_id
-        )
+        completion_query = db.query(TestCompletion).filter(TestCompletion.user_id == user_id)
+        if test_id:
+            completion_query = completion_query.filter(TestCompletion.test_id == test_id)
         if session_id:
-            query = query.filter(Response.session_id == session_id)
-        responses = query.all()
+            completion_query = completion_query.filter(TestCompletion.session_id == session_id)
+        completion = completion_query.order_by(TestCompletion.completed_at.desc()).first()
 
-        total = len(responses)
+        if not completion:
+            return jsonify(_empty_results())
+
+        responses = db.query(Response).filter(
+            Response.user_id == user_id,
+            Response.test_id == completion.test_id,
+            Response.session_id == completion.session_id,
+        ).all()
+
         correct = sum(1 for r in responses if r.is_correct is True)
         incorrect = sum(1 for r in responses if r.is_correct is False)
         skipped = sum(1 for r in responses if r.selected_answer is None)
+        answered = correct + incorrect
+        accuracy = round((correct / answered) * 100, 1) if answered > 0 else None
 
-        subjects = {}
-        for r in responses:
-            question = db.query(Question).filter(Question.id == r.question_id).first()
-            if not question:
-                continue
-            subj = question.subject or "Unknown"
-            if subj not in subjects:
-                subjects[subj] = {"correct": 0, "incorrect": 0, "skipped": 0}
-            if r.is_correct is True:
-                subjects[subj]["correct"] += 1
-            elif r.selected_answer is None:
-                subjects[subj]["skipped"] += 1
-            else:
-                subjects[subj]["incorrect"] += 1
+        question_ids = [r.question_id for r in responses]
+        questions_by_id = {
+            q.id: q for q in db.query(Question).filter(Question.id.in_(question_ids)).all()
+        } if question_ids else {}
 
-        accuracy = round((correct / total * 100)) if total > 0 else 0
-
-        by_skill = {}
-        for skill, counts in subjects.items():
-            answered = counts["correct"] + counts["incorrect"]
-            pct_correct = round((counts["correct"] / answered * 100)) if answered > 0 else 0
-            by_skill[skill] = {**counts, "pct_correct": pct_correct}
-
-        # Calculate math and R&W scores separately (200-800 scale each)
+        skill_stats: dict = {}
         math_correct = math_total = rw_correct = rw_total = 0
         for r in responses:
-            question = db.query(Question).filter(Question.id == r.question_id).first()
-            if not question or not question.subject:
+            q = questions_by_id.get(r.question_id)
+            if not q:
                 continue
-            if "math" in question.subject.lower():
+
+            skill = q.subject or "Unknown"
+            stats = skill_stats.setdefault(skill, {"correct": 0, "incorrect": 0, "skipped": 0})
+            if r.is_correct is True:
+                stats["correct"] += 1
+            elif r.selected_answer is None:
+                stats["skipped"] += 1
+            else:
+                stats["incorrect"] += 1
+
+            if q.subject and "math" in q.subject.lower():
                 math_total += 1
                 if r.is_correct:
                     math_correct += 1
@@ -202,9 +223,26 @@ def get_results():
                 if r.is_correct:
                     rw_correct += 1
 
+        skills = []
+        for skill, stats in skill_stats.items():
+            skill_answered = stats["correct"] + stats["incorrect"]
+            skill_accuracy = round((stats["correct"] / skill_answered) * 100, 1) if skill_answered > 0 else None
+            skills.append({"skill": skill, **stats, "accuracy": skill_accuracy})
+
         math_score = round(200 + (math_correct / math_total) * 600) if math_total > 0 else None
         rw_score = round(200 + (rw_correct / rw_total) * 600) if rw_total > 0 else None
-        total_score = (math_score + rw_score) if math_score and rw_score else None
+        total_score = (math_score + rw_score) if math_score is not None and rw_score is not None else None
+
+        # Prefer IRT-computed scores when available
+        math_band = rw_band = None
+        if session_id:
+            irt = db.query(TestScore).filter_by(session_id=session_id).first()
+            if irt:
+                math_score = irt.math_score if irt.math_score is not None else math_score
+                rw_score = irt.rw_score if irt.rw_score is not None else rw_score
+                total_score = irt.total_score if irt.total_score is not None else total_score
+                math_band = irt.math_band
+                rw_band = irt.rw_band
 
         # Prefer IRT-computed scores when available
         math_band = rw_band = None
@@ -218,9 +256,9 @@ def get_results():
                 rw_band = irt.rw_band
 
         return jsonify({
-            "test_id": test_id,
-            "user_id": user_id,
-            "total": total,
+            "has_data": True,
+            "test_id": completion.test_id,
+            "session_id": completion.session_id,
             "correct": correct,
             "incorrect": incorrect,
             "skipped": skipped,
@@ -243,7 +281,10 @@ def get_incorrect_questions():
     """Return the full question details for every question the student got wrong."""
     db = SessionLocal()
     try:
-        user_id = request.args.get("user_id")
+        user_id = require_user(request)
+        if not user_id:
+            return jsonify({"error": "Unauthorized"}), 401
+
         test_id = int(request.args.get("test_id"))
         session_id = request.args.get("session_id")
 
@@ -286,7 +327,10 @@ def get_correct_questions():
     """Return full question details for every question the student got right."""
     db = SessionLocal()
     try:
-        user_id = request.args.get("user_id")
+        user_id = require_user(request)
+        if not user_id:
+            return jsonify({"error": "Unauthorized"}), 401
+
         test_id = int(request.args.get("test_id"))
         session_id = request.args.get("session_id")
 
@@ -329,7 +373,10 @@ def get_skipped_questions():
     """Return full question details for every question the student skipped."""
     db = SessionLocal()
     try:
-        user_id = request.args.get("user_id")
+        user_id = require_user(request)
+        if not user_id:
+            return jsonify({"error": "Unauthorized"}), 401
+
         test_id = int(request.args.get("test_id"))
         session_id = request.args.get("session_id")
 

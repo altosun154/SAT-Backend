@@ -1,5 +1,6 @@
 from flask import Blueprint, jsonify, request
 from database import SessionLocal, Test, Response, Assignment, PracticeResponse
+from auth import require_user
 
 assignments_bp = Blueprint("assignments", __name__)
 
@@ -97,14 +98,15 @@ def get_assignment_status(user_id):
 
 @assignments_bp.route("/practice-results", methods=["GET"])
 def get_practice_results():
-    """Return practice session results for a user, optionally filtered by topic."""
+    """Return practice session results for the logged-in user, optionally
+    filtered by topic."""
     db = SessionLocal()
     try:
-        user_id = request.args.get("user_id")
-        topic = request.args.get("topic")
-
+        user_id = require_user(request)
         if not user_id:
-            return jsonify({"error": "user_id is required"}), 400
+            return jsonify({"error": "Unauthorized"}), 401
+
+        topic = request.args.get("topic")
 
         query = db.query(PracticeResponse).filter(PracticeResponse.user_id == user_id)
         if topic:
@@ -114,9 +116,11 @@ def get_practice_results():
         total = len(responses)
         correct = sum(1 for r in responses if r.is_correct is True)
         incorrect = sum(1 for r in responses if r.is_correct is False)
-        accuracy = round((correct / total * 100)) if total > 0 else 0
+        has_data = total > 0
+        accuracy = round((correct / total) * 100, 1) if total > 0 else None
 
         return jsonify({
+            "has_data": has_data,
             "user_id": user_id,
             "topic": topic,
             "total": total,

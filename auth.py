@@ -146,7 +146,7 @@ def login_verify_2fa():
         db.close()
 
 
-def _require_user(request):
+def require_user(request):
     """Decode the Authorization bearer token and return the user_id, or None."""
     header = request.headers.get("Authorization", "")
     if not header.startswith("Bearer "):
@@ -163,7 +163,7 @@ def _require_user(request):
 @auth_bp.route("/2fa/status", methods=["GET"])
 def status_2fa():
     """Return whether 2FA is currently enabled for the authenticated user."""
-    user_id = _require_user(request)
+    user_id = require_user(request)
     if not user_id:
         return jsonify({"error": "Unauthorized"}), 401
 
@@ -181,7 +181,7 @@ def status_2fa():
 @auth_bp.route("/2fa/setup", methods=["POST"])
 def setup_2fa():
     """Generate a new TOTP secret for the authenticated user and return a QR code to scan."""
-    user_id = _require_user(request)
+    user_id = require_user(request)
     if not user_id:
         return jsonify({"error": "Unauthorized"}), 401
 
@@ -215,7 +215,7 @@ def setup_2fa():
 @auth_bp.route("/2fa/enable", methods=["POST"])
 def enable_2fa():
     """Confirm setup by verifying a code from the authenticator app, then turn 2FA on."""
-    user_id = _require_user(request)
+    user_id = require_user(request)
     if not user_id:
         return jsonify({"error": "Unauthorized"}), 401
 
@@ -243,7 +243,7 @@ def enable_2fa():
 @auth_bp.route("/2fa/disable", methods=["POST"])
 def disable_2fa():
     """Disable 2FA for the authenticated user after re-checking their password."""
-    user_id = _require_user(request)
+    user_id = require_user(request)
     if not user_id:
         return jsonify({"error": "Unauthorized"}), 401
 
