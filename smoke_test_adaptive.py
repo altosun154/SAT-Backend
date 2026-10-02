@@ -160,11 +160,16 @@ if ts:
           f"rw_band={ts.rw_band}, math_band={ts.math_band}")
 db.close()
 
-# /results should return IRT fields
+# /results should return IRT fields. /results requires a verified JWT (not a
+# bare user_id query param) since it would otherwise let any caller read any
+# user's results — see routes_results.py.
+from auth import _make_token  # noqa: E402
+token_99 = _make_token(99)
 results_resp = client.get(
-    f"/results?user_id=99&test_id={test_id}&session_id={irt_session}"
+    f"/results?test_id={test_id}&session_id={irt_session}",
+    headers={"Authorization": f"Bearer {token_99}"},
 ).get_json()
-check("/results returns math_band field", "math_band" in results_resp,
+check("/results returns math_band field", results_resp and "math_band" in results_resp,
       str(results_resp.keys() if results_resp else "no response"))
 
 # Admin IRT status endpoint (no auth in smoke test — expect 401)

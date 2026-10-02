@@ -1,6 +1,7 @@
 from flask import Blueprint, jsonify, request
 from database import SessionLocal, Question, Response, TestCompletion, TestScore
 from grading import answers_match
+from auth import require_user
 
 results_bp = Blueprint("results", __name__)
 
@@ -235,25 +236,13 @@ def get_results():
 
         # Prefer IRT-computed scores when available
         math_band = rw_band = None
-        if session_id:
-            irt = db.query(TestScore).filter_by(session_id=session_id).first()
-            if irt:
-                math_score = irt.math_score if irt.math_score is not None else math_score
-                rw_score = irt.rw_score if irt.rw_score is not None else rw_score
-                total_score = irt.total_score if irt.total_score is not None else total_score
-                math_band = irt.math_band
-                rw_band = irt.rw_band
-
-        # Prefer IRT-computed scores when available
-        math_band = rw_band = None
-        if session_id:
-            irt = db.query(TestScore).filter_by(session_id=session_id).first()
-            if irt:
-                math_score = irt.math_score if irt.math_score is not None else math_score
-                rw_score = irt.rw_score if irt.rw_score is not None else rw_score
-                total_score = irt.total_score if irt.total_score is not None else total_score
-                math_band = irt.math_band
-                rw_band = irt.rw_band
+        irt = db.query(TestScore).filter_by(session_id=completion.session_id).first()
+        if irt:
+            math_score = irt.math_score if irt.math_score is not None else math_score
+            rw_score = irt.rw_score if irt.rw_score is not None else rw_score
+            total_score = irt.total_score if irt.total_score is not None else total_score
+            math_band = irt.math_band
+            rw_band = irt.rw_band
 
         return jsonify({
             "has_data": True,
@@ -268,9 +257,7 @@ def get_results():
             "total_score": total_score,
             "math_band": math_band,
             "rw_band": rw_band,
-            "percentile": None,
-            "by_subject": subjects,
-            "by_skill": by_skill
+            "skills": skills,
         })
     finally:
         db.close()
