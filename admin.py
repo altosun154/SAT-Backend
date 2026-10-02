@@ -7,7 +7,7 @@ from datetime import datetime, timezone, timedelta
 from functools import wraps
 from flask import Blueprint, g, jsonify, request
 from sqlalchemy.exc import IntegrityError
-from database import SessionLocal, User, Test, Assignment, Response, Question, TestUnlock, TestDraft
+from database import SessionLocal, User, Test, Assignment, Response, Question, TestUnlock, TestDraft, PoolQuestion
 from test_file_parser import SUBJECT_MAP, parse_test_file
 
 ALLOWED_TEST_UPLOAD_EXTENSIONS = (".pdf", ".docx")
@@ -164,7 +164,8 @@ def get_users():
 def get_tests():
     db = SessionLocal()
     try:
-        tests = db.query(Test).all()
+        # tests still waiting for their adaptive Module 2 can't be assigned yet
+        tests = db.query(Test).filter(Test.is_published.isnot(False)).order_by(Test.id).all()
         return jsonify([{"id": t.id, "name": t.title} for t in tests])
     finally:
         db.close()
@@ -210,6 +211,9 @@ def delete_test(test_id):
             return jsonify({"error": "Test not found"}), 404
 
         db.query(Question).filter(Question.test_id == test_id).delete()
+        # give this test's adaptive Module 2 questions back to the pool
+        db.query(PoolQuestion).filter(PoolQuestion.used_in_test_id == test_id).update(
+            {PoolQuestion.used_in_test_id: None}, synchronize_session=False)
         db.query(Assignment).filter(Assignment.test_id == test_id).delete()
         db.query(TestUnlock).filter(TestUnlock.test_id == test_id).delete()
         db.delete(test)

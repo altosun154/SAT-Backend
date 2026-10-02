@@ -1,5 +1,6 @@
 from flask import Blueprint, jsonify, request
 from database import SessionLocal, Question, Response, TestCompletion, TestQuestion
+from grading import answers_match
 
 responses_bp = Blueprint("responses", __name__)
 
@@ -72,7 +73,8 @@ def submit_answer():
             selected = item.get("selected_answer") or item.get("selected_choice")
 
             question = db.query(Question).filter(Question.id == question_id).first()
-            is_correct = question.correct_answer.upper() == selected.upper() if question and selected else None
+            # handles letters and typed math answers ("3/4" == ".75"); see grading.py
+            is_correct = answers_match(selected, question.correct_answer) if question and selected else None
 
             response = Response(
                 user_id=user_id,
@@ -87,6 +89,19 @@ def submit_answer():
         if is_final:
             db.add(TestCompletion(user_id=user_id, test_id=test_id, session_id=session_id))
         db.commit()
+
+        if is_final:
+            try:
+                from irt_scoring import compute_and_store_score
+                compute_and_store_score(user_id, test_id, session_id)
+            except Exception:
+                pass
+            try:
+                from irt_calibration import maybe_trigger_calibration
+                maybe_trigger_calibration()
+            except Exception:
+                pass
+
         return jsonify({"success": True, "saved": len(answers)})
     finally:
         db.close()

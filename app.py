@@ -8,6 +8,8 @@ from routes_assignments import assignments_bp
 from routes_parent import parent_bp
 from routes_parse import parse_bp
 from routes_imports import imports_bp
+from routes_adaptive import adaptive_bp
+from routes_irt import irt_bp
 from auth import auth_bp
 from admin import admin_bp
 from activity import activity_bp
@@ -28,6 +30,8 @@ app.register_blueprint(assignments_bp)
 app.register_blueprint(parent_bp)
 app.register_blueprint(parse_bp)
 app.register_blueprint(imports_bp)
+app.register_blueprint(adaptive_bp)
+app.register_blueprint(irt_bp)
 app.register_blueprint(auth_bp)
 app.register_blueprint(admin_bp)
 app.register_blueprint(activity_bp)
